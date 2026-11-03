@@ -202,6 +202,17 @@ int prefill_chunk_size();
 // `kv_idx` (i64 [T_seq]) and reads the full [0, max_n_kv) window. `mask`
 // is [max_n_kv, T_seq] f16 — column `c` masks the c-th query position.
 // Used by the spec-decode verify pass.
+//
+// fa_q_rows chooses how the flash attention sees the T_seq query rows.
+// ggml's CPU kernel takes a tiled path for a block of 64 or more query rows
+// and a row-by-row one below that; the two round differently, but within
+// each path every row's result depends only on that row, the K/V and the
+// mask. 0: one op over the T_seq rows (the kernel decides). > 0: ops of at
+// most fa_q_rows rows (row-by-row whatever T_seq is, for fa_q_rows < 64).
+// < 0: one op over the rows padded with zero rows to at least -fa_q_rows
+// (tiled for -fa_q_rows >= 64); `mask` must then have that many rows. Either
+// way a prompt prefilled in several graphs (a cached prefix, then the rest)
+// can reproduce, row for row, the path one graph over the whole prompt takes.
 ggml_tensor * block_step_n(ggml_context *      ctx,
                            ggml_cgraph *       gf,
                            ggml_tensor *       x,  // [hidden, T_seq]
@@ -211,10 +222,11 @@ ggml_tensor * block_step_n(ggml_context *      ctx,
                            int                 layer_idx,
                            int                 T_seq,
                            int                 max_n_kv,
-                           ggml_tensor *       mask,       // [max_n_kv, T_seq] f16
+                           ggml_tensor *       mask,       // [max_n_kv, T_seq (or the padded rows)] f16
                            ggml_tensor *       positions,  // [T_seq] i32
                            ggml_tensor *       kv_idx,     // [T_seq] i64
-                           bool                use_flash);
+                           bool                use_flash,
+                           int                 fa_q_rows = 0);
 
 // Block forward (batched step). Runs one block on B new tokens
 // (x = [hidden, B]), one per utterance stepping in lockstep against a

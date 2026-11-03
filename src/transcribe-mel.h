@@ -81,6 +81,12 @@ struct MelConfig {
     //                      per-utterance maximum, so each frame is
     //                      causal/streaming-safe. Still drops the trailing
     //                      center-pad STFT frame.
+    //   "log10"         — the per_utterance log-mel before normalization:
+    //                     log10(max(x, 1e-10)) for every STFT frame,
+    //                     including the trailing center-pad frame. For
+    //                     callers that apply the per_utterance clamp and
+    //                     scaling themselves (incremental frontends that
+    //                     see the audio in pieces).
     //   "sentence_mean" — SpeechBrain Fbank + InputNormalization(norm_type=
     //                     "sentence", std_norm=False): power-to-dB
     //                     10*log10(max(x, log_clamp_min)), then the

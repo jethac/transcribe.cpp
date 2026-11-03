@@ -83,6 +83,12 @@ struct QwenAsrModel final : public transcribe_model {
 
     std::optional<transcribe::MelFrontend> mel;
 
+    // Same frontend with normalize = "log10": the raw per-frame log-mel the
+    // streaming path normalizes itself (see stream_feed in model.cpp). Set
+    // only when the offline frontend is the Whisper per_utterance one with
+    // centered reflect padding, the case the streaming path reproduces.
+    std::optional<transcribe::MelFrontend> mel_log10;
+
     // Jinja chat template string from the GGUF KV (empty == none).
     std::string chat_template;
 
@@ -109,6 +115,46 @@ struct QwenAsrSession final : public transcribe_session {
 
     bool encoder_use_flash = true;
     bool decoder_use_flash = true;
+
+    // Streaming (transcribe_stream_*): the conv stem runs on each 1 s mel
+    // chunk as soon as its audio has arrived; finalize runs the last chunk,
+    // the encoder transformer and the decoder. See stream_feed in model.cpp.
+    transcribe_run_params stream_run_params{};    // strings owned by the session
+    std::vector<float>    stream_pcm;             // all audio received
+    std::vector<float>    stream_log_mel;         // raw log10 mel, frame-major [t][n_mels]
+    int                   stream_n_frames = 0;    // frames in stream_log_mel (all final)
+    float                 stream_max      = 0.0f; // max over stream_log_mel
+    int                   stream_n_chunks = 0;    // chunks through the conv stem
+    std::vector<float>    stream_chunk_mel;       // normalized mel each chunk was run with
+    std::vector<float>    stream_subsample;       // conv stem output per chunk
+    int64_t               stream_feed_us   = 0;   // time spent inside stream_feed
+    int64_t               stream_conv_us   = 0;   // of which conv stem
+    int                   stream_rerun_feed = 0;  // chunks re-run during feed (max rose)
+    int                   stream_recomputed = 0;  // chunks re-run at finalize
+
+    // Prompt-prefix cache (see run_impl). kv_ids are the prompt tokens whose
+    // K/V sit in kv_cache rows [0, kv_ids.size()): the chat frame and the
+    // system context up to and including <|audio_start|> of the last prompt.
+    // A run whose prompt starts with the same tokens prefills only the rest.
+    std::vector<int32_t> kv_ids;
+    // Per cached row: computed by ggml's tiled flash-attention path (a graph
+    // of 64+ query rows) or row by row; a row is reused only by a prompt
+    // whose single-graph prefill would take the same path (decoder.h).
+    std::vector<uint8_t> kv_tiled;
+    // The "language X<asr_text>" ids the last auto-detect run generated. The
+    // next auto-detect run appends them to its prompt as a draft and keeps
+    // the ones the model itself predicts (greedy verification).
+    std::vector<int32_t> header_draft;
+    // Last run / stream_begin, for the perf log.
+    int     kv_reused        = 0;  // prompt rows taken from the cache
+    int     kv_prefilled     = 0;  // prompt rows computed
+    int     draft_n          = 0;  // header tokens drafted
+    int     draft_ok         = 0;  // of which accepted
+    int64_t t_prefill_us     = 0;  // prefill graph build + compute
+    int     begin_prefilled  = 0;  // rows prefilled by stream_begin / stream_feed
+    int64_t t_begin_prefill_us = 0;
+    int     stream_prefix_tiled = -1;  // path of the stream's cached prefix (-1: none)
+    int     stream_prompt_rows  = 0;   // the stream's prompt rows besides the audio
 
     QwenAsrSession() = default;
     ~QwenAsrSession() override;

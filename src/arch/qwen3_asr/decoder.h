@@ -86,6 +86,52 @@ PrefillBuild build_prefill_graph(ggml_context *                   ctx,
                                  int                              kv_batch_slot = 0,
                                  int                              kv_n_batch    = 1);
 
+// ---------- Prefill after a cached prefix ----------
+
+// ggml's CPU flash attention runs blocks of at least this many query rows
+// tiled and smaller ones row by row (GGML_FA_TILE_Q in ggml-cpu/common.h);
+// the two round differently. build_prefill_graph's single graph over
+// T_prompt rows is therefore tiled iff T_prompt >= k_fa_tile_rows, and a
+// prefill split across graphs reproduces it by choosing the same path for
+// every row (fa_q_rows below, causal_lm::block_step_n).
+constexpr int k_fa_tile_rows = 64;
+
+struct PrefillChunkBuild {
+    ggml_tensor * input_ids_in = nullptr;  // [T_chunk] i32 (null when the chunk is all audio)
+    ggml_tensor * enc_out_in   = nullptr;  // [enc_output_dim, aud_n] f32 (null when aud_n == 0)
+    ggml_tensor * positions_in = nullptr;  // [T_chunk] i32 for RoPE
+    ggml_tensor * kv_idx_in    = nullptr;  // [T_chunk] i64, KV write rows
+    ggml_tensor * mask_in      = nullptr;  // [max_n_kv, mask_rows] f16 (fill_prefill_chunk_mask)
+    ggml_tensor * out          = nullptr;  // [vocab, n_logits] logits of the last n_logits positions
+    ggml_cgraph * graph        = nullptr;
+    int           mask_rows    = 0;        // T_chunk, or the padded query rows (fa_q_rows < 0)
+};
+
+// Prefill T_chunk prompt positions [n_past, n_past + T_chunk) on top of KV
+// rows [0, n_past) that are already in the cache (a prompt prefix shared with
+// an earlier run). The chunk is laid out [pre_n tokens | aud_n audio rows |
+// suf_n tokens]; max_n_kv = n_past + T_chunk is the attention width. Outputs
+// the logits of the last n_logits positions, or none (n_logits = 0: the run
+// only fills the cache). Requires a single-slot cache. fa_q_rows as in
+// causal_lm::block_step_n: with tiled = (the whole prompt's single graph
+// would be tiled), pass -k_fa_tile_rows for a tiled prompt split below 64
+// rows, a block under 64 for a row-by-row one split at 64 rows or more, and
+// 0 otherwise; each row then matches the single-graph prefill bit for bit
+// (on backends whose matrix products do not depend on the row count, as
+// ggml's CPU kernels without weight repacking).
+PrefillChunkBuild build_prefill_chunk_graph(ggml_context *                   ctx,
+                                            const QwenAsrWeights &           weights,
+                                            const QwenAsrHParams &           hp,
+                                            transcribe::causal_lm::KvCache & kv_cache,
+                                            int                              T_chunk,
+                                            int                              max_n_kv,
+                                            int                              pre_n,
+                                            int                              aud_n,
+                                            int                              suf_n,
+                                            int                              n_logits,
+                                            bool                             use_flash,
+                                            int                              fa_q_rows);
+
 // ---------- Step graph (one token) ----------
 
 struct StepBuild {

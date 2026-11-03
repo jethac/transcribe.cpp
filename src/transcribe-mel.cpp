@@ -510,7 +510,8 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     // to the per-bin mean/std normalize that follows).
     std::vector<float> log_mel(static_cast<size_t>(n_mels) * static_cast<size_t>(n_frames));
 
-    const bool whisper_mode = (cfg_.normalize == "per_utterance" || cfg_.normalize == "global");
+    const bool whisper_mode =
+        (cfg_.normalize == "per_utterance" || cfg_.normalize == "global" || cfg_.normalize == "log10");
 
     // SpeechBrain power-to-dB (normalize == "sentence_mean"):
     // 10*log10(max(x, amin)) in fp64, one rounding at storage.
@@ -826,6 +827,14 @@ transcribe_status MelFrontend::compute(const float *        pcm,
                 }
             }
         }
+        return TRANSCRIBE_OK;
+    }
+
+    // ---- 5l. Raw Whisper log-mel (no normalization, every frame) ----
+    if (cfg_.normalize == "log10") {
+        out_mel      = std::move(log_mel);
+        out_n_mels   = n_mels;
+        out_n_frames = n_frames;
         return TRANSCRIBE_OK;
     }
 

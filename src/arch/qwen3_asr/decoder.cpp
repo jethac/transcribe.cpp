@@ -16,6 +16,7 @@
 #include "transcribe-debug.h"
 #include "transcribe-log.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -237,6 +238,111 @@ PrefillBuild build_prefill_graph(ggml_context *                   ctx,
         ggml_build_forward_expand(gf, pb.dumps.out_before_head);
     }
 
+    return pb;
+}
+
+// Prefill after a cached prefix (see decoder.h).
+
+PrefillChunkBuild build_prefill_chunk_graph(ggml_context *                   ctx,
+                                            const QwenAsrWeights &           weights,
+                                            const QwenAsrHParams &           hp,
+                                            transcribe::causal_lm::KvCache & kv_cache,
+                                            int                              T_chunk,
+                                            int                              max_n_kv,
+                                            int                              pre_n,
+                                            int                              aud_n,
+                                            int                              suf_n,
+                                            int                              n_logits,
+                                            bool                             use_flash,
+                                            int                              fa_q_rows) {
+    PrefillChunkBuild pb{};
+    if (ctx == nullptr || T_chunk <= 0 || pre_n < 0 || aud_n < 0 || suf_n < 0 || pre_n + aud_n + suf_n != T_chunk ||
+        max_n_kv < T_chunk || n_logits < 0 || n_logits > T_chunk) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                "qwen3_asr decoder: bad chunk geometry (T_chunk=%d max_n_kv=%d pre=%d aud=%d suf=%d logits=%d)",
+                T_chunk, max_n_kv, pre_n, aud_n, suf_n, n_logits);
+        return pb;
+    }
+    if (kv_cache.self_k == nullptr || kv_cache.self_v == nullptr || max_n_kv > kv_cache.n_ctx) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr decoder: kv_cache missing or too small (max_n_kv=%d)",
+                max_n_kv);
+        return pb;
+    }
+
+    const int64_t hidden  = hp.dec_hidden;
+    const int64_t vocab   = hp.dec_vocab_size;
+    const int     n_layer = hp.dec_n_layers;
+    const auto    bp      = to_block_params(hp);
+
+    // A chunk made only of audio rows needs no token embeddings; leave the
+    // input out rather than creating one the graph never reaches.
+    if (pre_n + suf_n > 0) {
+        pb.input_ids_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_chunk);
+        named(pb.input_ids_in, "dec.chunk.input_ids");
+        ggml_set_input(pb.input_ids_in);
+    }
+    if (aud_n > 0) {
+        pb.enc_out_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.enc_output_dim, aud_n);
+        named(pb.enc_out_in, "dec.chunk.enc_out");
+        ggml_set_input(pb.enc_out_in);
+    }
+    pb.positions_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_chunk);
+    named(pb.positions_in, "dec.chunk.positions");
+    ggml_set_input(pb.positions_in);
+
+    pb.kv_idx_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, T_chunk);
+    named(pb.kv_idx_in, "dec.chunk.kv_idx");
+    ggml_set_input(pb.kv_idx_in);
+
+    pb.mask_rows = (fa_q_rows < 0) ? std::max(T_chunk, -fa_q_rows) : T_chunk;
+    pb.mask_in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, max_n_kv, pb.mask_rows);
+    named(pb.mask_in, "dec.chunk.attn_mask");
+    ggml_set_input(pb.mask_in);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, /*size=*/16384, /*grads=*/false);
+    if (gf == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr decoder: ggml_new_graph_custom failed");
+        return pb;
+    }
+    pb.graph = gf;
+
+    // The single-shot builder's three-way splice, restricted to this chunk.
+    ggml_tensor * token_emb =
+        (pb.input_ids_in != nullptr) ? ggml_get_rows(ctx, weights.dec_embed.token_w, pb.input_ids_in) : nullptr;
+    const size_t emb_elem = (token_emb != nullptr) ? ggml_element_size(token_emb) : 0;
+
+    ggml_tensor * x = nullptr;
+    if (pre_n > 0) {
+        x = ggml_cont(ctx, ggml_view_2d(ctx, token_emb, hidden, pre_n, emb_elem * hidden, /*off=*/0));
+    }
+    if (aud_n > 0) {
+        x = (x == nullptr) ? pb.enc_out_in : ggml_concat(ctx, x, pb.enc_out_in, /*dim=*/1);
+    }
+    if (suf_n > 0) {
+        ggml_tensor * x_suffix = ggml_cont(ctx, ggml_view_2d(ctx, token_emb, hidden, suf_n, emb_elem * hidden,
+                                                             emb_elem * hidden * static_cast<size_t>(pre_n + aud_n)));
+        x                      = (x == nullptr) ? x_suffix : ggml_concat(ctx, x, x_suffix, /*dim=*/1);
+    }
+
+    for (int il = 0; il < n_layer; ++il) {
+        x = causal_lm::block_step_n(ctx, gf, x, to_block_view(weights.dec_blocks[il]), bp, kv_cache, il, T_chunk,
+                                    max_n_kv, pb.mask_in, pb.positions_in, pb.kv_idx_in, use_flash, fa_q_rows);
+    }
+
+    if (n_logits > 0) {
+        ggml_tensor * last_x = ggml_view_2d(ctx, x, hidden, n_logits, ggml_element_size(x) * hidden,
+                                            ggml_element_size(x) * hidden * static_cast<size_t>(T_chunk - n_logits));
+        last_x               = ggml_cont(ctx, last_x);
+        last_x               = ggml_mul(ctx, ggml_rms_norm(ctx, last_x, hp.dec_rms_norm_eps), weights.dec_final.norm_w);
+        ggml_tensor * logits = ggml_mul_mat(ctx, weights.dec_embed.token_w, last_x);
+        named(logits, "dec.chunk.logits");
+        pb.out = logits;
+        (void) vocab;
+        ggml_set_output(pb.out);
+        ggml_build_forward_expand(gf, pb.out);
+    } else {
+        ggml_build_forward_expand(gf, x);
+    }
     return pb;
 }
 

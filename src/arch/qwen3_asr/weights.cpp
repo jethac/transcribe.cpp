@@ -417,9 +417,21 @@ transcribe_status build_qwen3_asr_weights(ggml_context *         ctx_meta,
     // four dims explicitly.
     GET_CONV(weights.enc_subsample.conv0_w, "enc.conv.0.weight", 3, 3, 1, ds_h);
     GET_F32(weights.enc_subsample.conv0_b, "enc.conv.0.bias", ds_h);
-    GET_CONV(weights.enc_subsample.conv1_w, "enc.conv.1.weight", 3, 3, ds_h, ds_h);
+    // conv.1 and conv.2 may also be stored as quantized 2D matrices
+    // [3*3*ds_h, ds_h] (one row per output channel); the encoder then runs
+    // them as im2col + mul_mat with the weight as src0, which is the
+    // operand ggml can quantize.
+    if (ggml_tensor * _q = ggml_get_tensor(ctx_meta, "enc.conv.1.weight"); _q && ggml_n_dims(_q) == 2) {
+        GET_LIN(weights.enc_subsample.conv1_w, "enc.conv.1.weight", 3 * 3 * ds_h, ds_h);
+    } else {
+        GET_CONV(weights.enc_subsample.conv1_w, "enc.conv.1.weight", 3, 3, ds_h, ds_h);
+    }
     GET_F32(weights.enc_subsample.conv1_b, "enc.conv.1.bias", ds_h);
-    GET_CONV(weights.enc_subsample.conv2_w, "enc.conv.2.weight", 3, 3, ds_h, ds_h);
+    if (ggml_tensor * _q = ggml_get_tensor(ctx_meta, "enc.conv.2.weight"); _q && ggml_n_dims(_q) == 2) {
+        GET_LIN(weights.enc_subsample.conv2_w, "enc.conv.2.weight", 3 * 3 * ds_h, ds_h);
+    } else {
+        GET_CONV(weights.enc_subsample.conv2_w, "enc.conv.2.weight", 3, 3, ds_h, ds_h);
+    }
     GET_F32(weights.enc_subsample.conv2_b, "enc.conv.2.bias", ds_h);
     // conv_out is a Linear (bias=False) mapping (ds_h * mel_ds3) -> d_model.
     GET_LIN(weights.enc_subsample.conv_out, "enc.conv_out.weight", conv_out_in, d_model);

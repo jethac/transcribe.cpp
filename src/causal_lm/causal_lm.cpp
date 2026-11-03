@@ -256,7 +256,6 @@ ggml_tensor * block_prefill(ggml_context *      ctx,
                             BlockOpts           opts) {
     const int64_t n_heads    = params.n_heads;
     const int64_t n_kv_heads = params.n_kv_heads;
-    const int64_t n_groups   = n_heads / n_kv_heads;
     const int64_t head_dim   = params.head_dim;
     const int64_t q_dim      = n_heads * head_dim;
     const int64_t kv_dim     = n_kv_heads * head_dim;
@@ -336,23 +335,12 @@ ggml_tensor * block_prefill(ggml_context *      ctx,
                                 /*logit_softcap=*/0.0f);
         o = ggml_reshape_2d(ctx, o, q_dim, T_seq);
     } else {
-        // Manual GQA path: emulate repeat_interleave via reshape
-        // -into-(1,Hkv) → repeat → collapse. Numerics match the
-        // reference's explicit repeat_kv.
-        ggml_tensor * K_att_c        = ggml_cont(ctx, K_att);
-        ggml_tensor * V_att_c        = ggml_cont(ctx, V_att);
-        ggml_tensor * K_4d           = ggml_reshape_4d(ctx, K_att_c, head_dim, T_seq, 1, n_kv_heads);
-        ggml_tensor * V_4d           = ggml_reshape_4d(ctx, V_att_c, head_dim, T_seq, 1, n_kv_heads);
-        ggml_tensor * K_rep_template = ggml_new_tensor_4d(ctx, K_att->type, head_dim, T_seq, n_groups, n_kv_heads);
-        ggml_tensor * V_rep_template = ggml_new_tensor_4d(ctx, V_att->type, head_dim, T_seq, n_groups, n_kv_heads);
-        ggml_tensor * K_rep          = ggml_repeat(ctx, K_4d, K_rep_template);
-        ggml_tensor * V_rep          = ggml_repeat(ctx, V_4d, V_rep_template);
-        ggml_tensor * K_full         = ggml_reshape_3d(ctx, K_rep, head_dim, T_seq, n_heads);
-        ggml_tensor * V_full         = ggml_reshape_3d(ctx, V_rep, head_dim, T_seq, n_heads);
-
-        ggml_tensor * kq      = ggml_mul_mat(ctx, K_full, Q_att);
+        // mul_mat broadcasts head h to KV head h / (n_heads / n_kv_heads).
+        // Keep only the compact KV-head copies required by the matrix layouts.
+        ggml_tensor * K_compact = ggml_cont(ctx, K_att);
+        ggml_tensor * kq        = ggml_mul_mat(ctx, K_compact, Q_att);
         ggml_tensor * kq_soft = ggml_soft_max_ext(ctx, kq, mask, scale_attn, /*max_bias=*/0.0f);
-        ggml_tensor * V_t     = ggml_cont(ctx, ggml_permute(ctx, V_full, 1, 0, 2, 3));
+        ggml_tensor * V_t     = ggml_cont(ctx, ggml_permute(ctx, V_att, 1, 0, 2, 3));
         o                     = ggml_mul_mat(ctx, V_t, kq_soft);
         o                     = ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3));
         o                     = ggml_reshape_2d(ctx, o, q_dim, T_seq);
@@ -395,7 +383,6 @@ ggml_tensor * block_step(ggml_context *      ctx,
                          bool                use_flash) {
     const int64_t n_heads    = params.n_heads;
     const int64_t n_kv_heads = params.n_kv_heads;
-    const int64_t n_groups   = n_heads / n_kv_heads;
     const int64_t head_dim   = params.head_dim;
     const int64_t q_dim      = n_heads * head_dim;
     const int64_t kv_dim     = n_kv_heads * head_dim;
@@ -454,7 +441,7 @@ ggml_tensor * block_step(ggml_context *      ctx,
     ggml_tensor * V_att = ggml_view_3d(ctx, kv_cache.self_v, head_dim, max_n_kv, n_kv_heads, v_elem * kv_dim,
                                        v_elem * head_dim, v_elem * static_cast<size_t>(layer_idx) * n_ctx * kv_dim);
 
-    ggml_tensor * Q_att = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
+    ggml_tensor * Q_att = ggml_permute(ctx, Q, 0, 2, 1, 3);
 
     ggml_tensor * o;
     if (use_flash) {
@@ -462,20 +449,12 @@ ggml_tensor * block_step(ggml_context *      ctx,
                                 /*logit_softcap=*/0.0f);
         o = ggml_reshape_2d(ctx, o, q_dim, 1);
     } else {
-        ggml_tensor * K_att_c        = ggml_cont(ctx, K_att);
-        ggml_tensor * V_att_c        = ggml_cont(ctx, V_att);
-        ggml_tensor * K_4d           = ggml_reshape_4d(ctx, K_att_c, head_dim, max_n_kv, 1, n_kv_heads);
-        ggml_tensor * V_4d           = ggml_reshape_4d(ctx, V_att_c, head_dim, max_n_kv, 1, n_kv_heads);
-        ggml_tensor * K_rep_template = ggml_new_tensor_4d(ctx, K_att->type, head_dim, max_n_kv, n_groups, n_kv_heads);
-        ggml_tensor * V_rep_template = ggml_new_tensor_4d(ctx, V_att->type, head_dim, max_n_kv, n_groups, n_kv_heads);
-        ggml_tensor * K_rep          = ggml_repeat(ctx, K_4d, K_rep_template);
-        ggml_tensor * V_rep          = ggml_repeat(ctx, V_4d, V_rep_template);
-        ggml_tensor * K_full         = ggml_reshape_3d(ctx, K_rep, head_dim, max_n_kv, n_heads);
-        ggml_tensor * V_full         = ggml_reshape_3d(ctx, V_rep, head_dim, max_n_kv, n_heads);
-
-        ggml_tensor * kq      = ggml_mul_mat(ctx, K_full, Q_att);
+        // mul_mat broadcasts head h to KV head h / (n_heads / n_kv_heads).
+        // Keep only the compact KV-head copies required by the matrix layouts.
+        ggml_tensor * K_compact = ggml_cont(ctx, K_att);
+        ggml_tensor * kq        = ggml_mul_mat(ctx, K_compact, Q_att);
         ggml_tensor * kq_soft = ggml_soft_max_ext(ctx, kq, mask, scale_attn, /*max_bias=*/0.0f);
-        ggml_tensor * V_t     = ggml_cont(ctx, ggml_permute(ctx, V_full, 1, 0, 2, 3));
+        ggml_tensor * V_t     = ggml_cont(ctx, ggml_permute(ctx, V_att, 1, 0, 2, 3));
         o                     = ggml_mul_mat(ctx, V_t, kq_soft);
         o                     = ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3));
         o                     = ggml_reshape_2d(ctx, o, q_dim, 1);
@@ -509,10 +488,10 @@ ggml_tensor * block_step_n(ggml_context *      ctx,
                            ggml_tensor *       mask,
                            ggml_tensor *       positions,
                            ggml_tensor *       kv_idx,
-                           bool                use_flash) {
+                           bool                use_flash,
+                           int                 fa_q_rows) {
     const int64_t n_heads    = params.n_heads;
     const int64_t n_kv_heads = params.n_kv_heads;
-    const int64_t n_groups   = n_heads / n_kv_heads;
     const int64_t head_dim   = params.head_dim;
     const int64_t q_dim      = n_heads * head_dim;
     const int64_t kv_dim     = n_kv_heads * head_dim;
@@ -571,25 +550,40 @@ ggml_tensor * block_step_n(ggml_context *      ctx,
     ggml_tensor * Q_att = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
 
     ggml_tensor * o;
-    if (use_flash) {
+    if (use_flash && fa_q_rows > 0 && T_seq > fa_q_rows) {
+        // Q_att is contiguous [D, T_seq, H] and mask [max_n_kv, T_seq]: both
+        // slice along T_seq as views.
+        o = nullptr;
+        for (int a = 0; a < T_seq; a += fa_q_rows) {
+            const int     n  = std::min(fa_q_rows, T_seq - a);
+            ggml_tensor * qb = ggml_view_3d(ctx, Q_att, head_dim, n, n_heads, Q_att->nb[1], Q_att->nb[2],
+                                            static_cast<size_t>(a) * Q_att->nb[1]);
+            ggml_tensor * mb = ggml_view_2d(ctx, mask, mask->ne[0], n, mask->nb[1], static_cast<size_t>(a) * mask->nb[1]);
+            ggml_tensor * ob = ggml_flash_attn_ext(ctx, qb, K_att, V_att, mb, scale_attn, /*max_bias=*/0.0f,
+                                                   /*logit_softcap=*/0.0f);
+            ob               = ggml_reshape_2d(ctx, ob, q_dim, n);
+            o                = (o == nullptr) ? ob : ggml_concat(ctx, o, ob, /*dim=*/1);
+        }
+    } else if (use_flash && fa_q_rows < 0 && T_seq < -fa_q_rows) {
+        // Zero query rows up to -fa_q_rows; their outputs are dropped. The
+        // output is [D, H, rows]: keep the first T_seq rows.
+        const int     rows = -fa_q_rows;
+        ggml_tensor * qp   = ggml_pad(ctx, Q_att, 0, rows - T_seq, 0, 0);
+        ggml_tensor * op   = ggml_flash_attn_ext(ctx, qp, K_att, V_att, mask, scale_attn, /*max_bias=*/0.0f,
+                                                 /*logit_softcap=*/0.0f);
+        o = ggml_view_2d(ctx, op, q_dim, T_seq, op->nb[2], 0);
+        o = ggml_cont(ctx, o);
+    } else if (use_flash) {
         o = ggml_flash_attn_ext(ctx, Q_att, K_att, V_att, mask, scale_attn, /*max_bias=*/0.0f,
                                 /*logit_softcap=*/0.0f);
         o = ggml_reshape_2d(ctx, o, q_dim, T_seq);
     } else {
-        ggml_tensor * K_att_c        = ggml_cont(ctx, K_att);
-        ggml_tensor * V_att_c        = ggml_cont(ctx, V_att);
-        ggml_tensor * K_4d           = ggml_reshape_4d(ctx, K_att_c, head_dim, max_n_kv, 1, n_kv_heads);
-        ggml_tensor * V_4d           = ggml_reshape_4d(ctx, V_att_c, head_dim, max_n_kv, 1, n_kv_heads);
-        ggml_tensor * K_rep_template = ggml_new_tensor_4d(ctx, K_att->type, head_dim, max_n_kv, n_groups, n_kv_heads);
-        ggml_tensor * V_rep_template = ggml_new_tensor_4d(ctx, V_att->type, head_dim, max_n_kv, n_groups, n_kv_heads);
-        ggml_tensor * K_rep          = ggml_repeat(ctx, K_4d, K_rep_template);
-        ggml_tensor * V_rep          = ggml_repeat(ctx, V_4d, V_rep_template);
-        ggml_tensor * K_full         = ggml_reshape_3d(ctx, K_rep, head_dim, max_n_kv, n_heads);
-        ggml_tensor * V_full         = ggml_reshape_3d(ctx, V_rep, head_dim, max_n_kv, n_heads);
-
-        ggml_tensor * kq      = ggml_mul_mat(ctx, K_full, Q_att);
+        // mul_mat broadcasts head h to KV head h / (n_heads / n_kv_heads).
+        // Keep only the compact KV-head copies required by the matrix layouts.
+        ggml_tensor * K_compact = ggml_cont(ctx, K_att);
+        ggml_tensor * kq        = ggml_mul_mat(ctx, K_compact, Q_att);
         ggml_tensor * kq_soft = ggml_soft_max_ext(ctx, kq, mask, scale_attn, /*max_bias=*/0.0f);
-        ggml_tensor * V_t     = ggml_cont(ctx, ggml_permute(ctx, V_full, 1, 0, 2, 3));
+        ggml_tensor * V_t     = ggml_cont(ctx, ggml_permute(ctx, V_att, 1, 0, 2, 3));
         o                     = ggml_mul_mat(ctx, V_t, kq_soft);
         o                     = ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3));
         o                     = ggml_reshape_2d(ctx, o, q_dim, T_seq);

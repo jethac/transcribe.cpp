@@ -1,3 +1,4 @@
+#include "asr_resource_snapshot.h"
 // arch/qwen3_asr/model.cpp - Qwen3-ASR family handler.
 
 #include "causal_lm/causal_lm.h"
@@ -40,6 +41,160 @@
 namespace transcribe::qwen3_asr {
 
 extern const Arch arch;
+
+struct WarmupState {
+    transcribe_session * session;
+    bool streaming;
+    int completed_steps = 0;
+};
+
+static thread_local WarmupState * active_warmup = nullptr;
+
+static bool khr_gpu_model_policy(const QwenAsrModel * cm) {
+    const char * policy = std::getenv("TRANSCRIBE_VULKAN_KHR_PROFILE");
+    return policy && !std::strcmp(policy, "1") && cm->plan.requested == TRANSCRIBE_BACKEND_VULKAN;
+}
+
+static bool khr_gpu_graph_policy(const QwenAsrSession * cc) {
+    return khr_gpu_model_policy(static_cast<const QwenAsrModel *>(cc->model));
+}
+
+static int initial_khr_kv_capacity(int64_t needed, int limit) {
+    int64_t capacity = 16;
+    while (capacity < needed && capacity < limit) capacity *= 2;
+    return static_cast<int>(std::min<int64_t>(capacity, limit));
+}
+
+static transcribe_status grow_khr_kv(QwenAsrSession * cc, int capacity) {
+    auto * cm = static_cast<QwenAsrModel *>(cc->model);
+    if (cc->sched) {
+        ggml_backend_sched_synchronize(cc->sched);
+        ggml_backend_sched_reset(cc->sched);
+    }
+    const int old_capacity = cc->kv_cache.n_ctx;
+    if (!transcribe::causal_lm::kv_grow(cc->kv_cache, cm->plan.primary, capacity,
+                                     cm->hparams.dec_n_kv_heads, cm->hparams.dec_head_dim,
+                                     cm->hparams.dec_n_layers)) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr: KV growth failed (%d -> %d)", old_capacity, capacity);
+        return TRANSCRIBE_ERR_OOM;
+    }
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
+            "qwen3_asr KHR KV grow: old_capacity=%d capacity=%d rows=%d head=%d",
+            old_capacity, cc->kv_cache.n_ctx, cc->kv_cache.n, cc->kv_cache.head);
+    return TRANSCRIBE_OK;
+}
+
+static transcribe_status release_subsample_scratch(QwenAsrSession * cc) {
+    if (!khr_gpu_graph_policy(cc) || !cc->sched) return TRANSCRIBE_OK;
+    auto * cm = static_cast<QwenAsrModel *>(cc->model);
+    ggml_backend_sched_synchronize(cc->sched);
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(cc->sched); ++i) {
+        const auto backend = ggml_backend_sched_get_backend(cc->sched, i);
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
+                "qwen3_asr KHR phase release: phase=subsample backend=%s scratch_bytes=%zu",
+                ggml_backend_name(backend), ggml_backend_sched_get_buffer_size(cc->sched, backend));
+    }
+    transcribe::safe_sched_free(cc->sched);
+    cc->sched = nullptr;
+    cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
+                                      static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
+    if (!cc->sched) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr: encoder scheduler recreation failed");
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    return TRANSCRIBE_OK;
+}
+
+static size_t compute_metadata_bytes(QwenAsrSession * cc, size_t default_bytes, int n_conv_chunks,
+                                     bool encoder, size_t decoder_graph_size) {
+    if (!khr_gpu_graph_policy(cc)) return default_bytes;
+    const auto * cm = static_cast<const QwenAsrModel *>(cc->model);
+    if (n_conv_chunks < 0 || cm->hparams.dec_n_layers < 0 ||
+        cc->encoder_use_flash || cc->decoder_use_flash) return 0;
+    size_t bytes = 0;
+    size_t tensor_slots = 256;
+    const auto add = [](size_t & dst, size_t value) {
+        if (value > std::numeric_limits<size_t>::max() - dst) return false;
+        dst += value;
+        return true;
+    };
+    const auto add_tensors = [&](size_t count, size_t per_item) {
+        return count <= std::numeric_limits<size_t>::max() / per_item &&
+               add(tensor_slots, count * per_item);
+    };
+    if (encoder && (!add_tensors(cm->weights.enc_blocks.size(), 256) ||
+                    !add(bytes, ggml_graph_overhead_custom(8192, false)))) return 0;
+    if (decoder_graph_size &&
+        (!add_tensors(static_cast<size_t>(cm->hparams.dec_n_layers), 256) ||
+         !add(bytes, ggml_graph_overhead_custom(decoder_graph_size, false)))) return 0;
+    const int passes[] = { n_conv_chunks >= kConvPassChunks ? kConvPassChunks : 0,
+                           n_conv_chunks % kConvPassChunks };
+    for (int chunks : passes) {
+        if (!chunks) continue;
+        const size_t groups = (static_cast<size_t>(chunks) + kConvChunkGroup - 1) / kConvChunkGroup;
+        if (!add_tensors(groups, 128) || !add(bytes, ggml_graph_overhead_custom(64 + 48 * groups, false))) return 0;
+    }
+    const size_t tensor_bytes = ggml_tensor_overhead();
+    if (tensor_slots > std::numeric_limits<size_t>::max() / tensor_bytes ||
+        !add(bytes, tensor_slots * tensor_bytes)) return 0;
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
+            "qwen3_asr KHR metadata: bytes=%zu tensor_slots=%zu encoder=%d decoder_graph=%zu conv_chunks=%d",
+            bytes, tensor_slots, encoder ? 1 : 0, decoder_graph_size, n_conv_chunks);
+    return bytes;
+}
+
+static bool check_qwen_graph_placement(QwenAsrSession * cc, ggml_cgraph * graph) {
+    if (khr_gpu_graph_policy(cc)) {
+        const auto * cm = static_cast<const QwenAsrModel *>(cc->model);
+        const char * primary = cm->plan.primary ? ggml_backend_name(cm->plan.primary) : "none";
+        if (!cm->plan.primary || cm->plan.primary_kind != BackendKind::Vulkan) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr KHR profile requires Vulkan, got %s", primary);
+            return false;
+        }
+        size_t gpu = 0, metadata = 0, rejected = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_VIEW || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_PERMUTE) {
+                ++metadata;
+                continue;
+            }
+            ggml_backend_t actual = ggml_backend_sched_get_tensor_backend(cc->sched, node);
+            if (actual != cm->plan.primary) {
+                ++rejected;
+                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                        "qwen3_asr KHR placement rejected before graph compute: node=%d name=%s op=%s backend=%s",
+                        i, node->name, ggml_op_name(node->op), actual ? ggml_backend_name(actual) : "unassigned");
+            } else {
+                ++gpu;
+            }
+        }
+        log_msg(rejected ? TRANSCRIBE_LOG_LEVEL_ERROR : TRANSCRIBE_LOG_LEVEL_INFO,
+                "qwen3_asr KHR placement: compute_gpu=%zu compute_rejected=%zu metadata=%zu policy=no_cpu_fallback",
+                gpu, rejected, metadata);
+        if (rejected) return false;
+    }
+    return true;
+}
+
+
+static ggml_status compute_qwen_graph(QwenAsrSession * cc, ggml_cgraph * graph) {
+    if (!check_qwen_graph_placement(cc, graph)) return GGML_STATUS_FAILED;
+    static std::atomic<unsigned> diagnostic_graphs{0};
+    const bool diagnostics = khr_gpu_graph_policy(cc) && transcribe::env::flag("TRANSCRIBE_RESOURCE_DIAGNOSTICS") &&
+        diagnostic_graphs.fetch_add(1, std::memory_order_relaxed) < 64;
+    char label[160] = {};
+    if (diagnostics) {
+        const char *mode = active_warmup && active_warmup->session == cc ?
+            (active_warmup->streaming ? "warm_streaming" : "warm_offline") : "request";
+        std::snprintf(label, sizeof(label), "mode=%s nodes=%d kv_n=%d kv_head=%d kv_capacity=%d",
+                      mode, ggml_graph_n_nodes(graph), cc->kv_cache.n, cc->kv_cache.head, cc->kv_cache.n_ctx);
+        asr_resource_snapshot("graph_begin", label);
+    }
+    const ggml_status status = ggml_backend_sched_graph_compute(cc->sched, graph);
+    if (diagnostics) asr_resource_snapshot("graph_end", label);
+    return status;
+}
 
 static_assert(std::is_base_of_v<transcribe_model, QwenAsrModel>);
 static_assert(std::is_base_of_v<transcribe_session, QwenAsrSession>);
@@ -114,7 +269,7 @@ int64_t qwen3_max_audio_ms(const QwenAsrHParams & hp) {
 transcribe_status resolve_chat_tokens(const transcribe::Tokenizer & tok, ChatTokens & out);
 
 transcribe_status load(Loader & loader, const transcribe_model_load_params * params, transcribe_model ** out_model) {
-    const int64_t t_load_start = ggml_time_us();
+    const int64_t t_load_start = INT64_C(0);
 
     auto m       = std::make_unique<QwenAsrModel>();
     m->arch      = &arch;
@@ -216,6 +371,15 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         }
 
         m->mel.emplace(cfg);
+        if (cfg.normalize == "per_utterance" && cfg.pad_mode == "reflect") {
+            transcribe::MelConfig raw = cfg;
+            raw.normalize             = "log10";
+            m->mel_log10.emplace(raw);
+        }
+        // Streaming runs the conv stem on each 1 s chunk while the audio
+        // arrives and the rest at finalize, with the offline transcript (see
+        // stream_feed). It needs the raw frontend above.
+        m->caps.supports_streaming = m->mel_log10.has_value();
     }
 
     // Reopen with no_alloc to build the tensor catalog.
@@ -241,6 +405,13 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
+    }
+    if (khr_gpu_model_policy(m.get()) && (!m->plan.primary || m->plan.primary_kind != BackendKind::Vulkan)) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                "qwen3_asr KHR profile: explicitly requested Vulkan resolved to %s before weight allocation",
+                m->plan.primary ? ggml_backend_name(m->plan.primary) : "none");
+        gguf_free(gguf_data);
+        return TRANSCRIBE_ERR_BACKEND;
     }
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
@@ -272,7 +443,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         }
     }
 
-    m->t_load_us = ggml_time_us() - t_load_start;
+    m->t_load_us = INT64_C(0) - t_load_start;
     *out_model   = m.release();
     return TRANSCRIBE_OK;
 }
@@ -298,11 +469,24 @@ transcribe_status init_context(transcribe_model *                model,
     cc->encoder_use_flash = true;
     cc->decoder_use_flash = true;
     transcribe::flash::apply_env_overrides(cc->encoder_use_flash, cc->decoder_use_flash);
+    if (khr_gpu_graph_policy(cc.get())) {
+        const char * forced = std::getenv("TRANSCRIBE_FORCE_FLASH");
+        if (forced && forced[0] && forced[0] != '0') {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr KHR profile conflicts with TRANSCRIBE_FORCE_FLASH");
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+        cc->encoder_use_flash = false;
+        cc->decoder_use_flash = false;
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "qwen3_asr KHR profile: non-flash GPU graph, no CPU compute fallback");
+    }
+
 
     // Pre-allocate KV cache at context creation so the first run
     // doesn't pay the allocation cost inside the decode phase.
     auto * cm = static_cast<QwenAsrModel *>(model);
-    {
+    if (khr_gpu_graph_policy(cc.get())) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "qwen3_asr KHR profile: KV allocation deferred to request capacity");
+    } else {
         ggml_type kv_type = GGML_TYPE_F16;
         if (cc->kv_type == TRANSCRIBE_KV_TYPE_F32) {
             kv_type = GGML_TYPE_F32;
@@ -441,6 +625,53 @@ transcribe_status encode_system_context(const transcribe::Tokenizer & tok,
     out = std::move(fit.term_ids);
     out.insert(out.end(), fit.ctx_ids.begin(), fit.ctx_ids.end());
     return TRANSCRIBE_OK;
+}
+
+// The prompt-prefix cache is on unless TRANSCRIBE_QWEN3_NO_PREFIX_CACHE is
+// set (for A/B runs); its results are bit-identical to the uncached path on
+// the CPU backend. The header draft is opt-in (TRANSCRIBE_QWEN3_HEADER_DRAFT):
+// its verification compares logits from the prefill graph with what the
+// step graph would have produced, which round differently, so it can change
+// a near-tie token.
+bool prefix_cache_enabled() {
+    return !transcribe::env::flag("TRANSCRIBE_QWEN3_NO_PREFIX_CACHE");
+}
+bool header_draft_enabled() {
+    return prefix_cache_enabled() && transcribe::env::flag("TRANSCRIBE_QWEN3_HEADER_DRAFT");
+}
+
+// Rows of the prompt-prefix cache usable for a prompt starting with the n ids
+// at b whose single-graph prefill takes the `tiled` attention path: the
+// common prefix of the ids, among rows computed on that same path.
+int common_prefix(const QwenAsrSession * cc, const int32_t * b, int n, bool tiled) {
+    const int m = std::min(static_cast<int>(cc->kv_ids.size()), n);
+    int       i = 0;
+    while (i < m && cc->kv_ids[i] == b[i] && (cc->kv_tiled[i] != 0) == tiled) {
+        ++i;
+    }
+    return i;
+}
+
+void clear_prefix_cache(QwenAsrSession * cc) {
+    cc->kv_ids.clear();
+    cc->kv_tiled.clear();
+}
+
+// fa_q_rows for a chunk of T_chunk query rows that must take the `tiled`
+// path (see build_prefill_chunk_graph).
+int chunk_fa_q_rows(int T_chunk, bool tiled) {
+    if (tiled) {
+        return T_chunk >= k_fa_tile_rows ? 0 : -k_fa_tile_rows;
+    }
+    return T_chunk >= k_fa_tile_rows ? k_fa_tile_rows / 2 : 0;
+}
+
+// Upload a chunk mask: fill_prefill_chunk_mask for the T_chunk real query
+// rows, all-visible rows for the padding (their outputs are dropped).
+void set_chunk_mask(const PrefillChunkBuild & pb, int max_n_kv, int T_chunk, int n_past) {
+    std::vector<ggml_fp16_t> mask(static_cast<size_t>(max_n_kv) * pb.mask_rows, ggml_fp32_to_fp16(0.0f));
+    transcribe::causal_lm::fill_prefill_chunk_mask(mask.data(), max_n_kv, T_chunk, n_past);
+    ggml_backend_tensor_set(pb.mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
 }
 
 }  // namespace
@@ -594,7 +825,7 @@ transcribe_status run_subsample(QwenAsrSession *     cc,
         transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
         for (int c0 = c_begin; c0 < c_end; c0 += pass) {
             ggml_backend_tensor_set(sb.mel_in, mel + static_cast<size_t>(c0) * in_chunk, 0, ggml_nbytes(sb.mel_in));
-            if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, sb.graph);
+            if (const ggml_status gs = compute_qwen_graph(cc, sb.graph);
                 gs != GGML_STATUS_SUCCESS) {
                 log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: subsample graph compute failed (%d)",
                         static_cast<int>(gs));
@@ -605,9 +836,17 @@ transcribe_status run_subsample(QwenAsrSession *     cc,
         return TRANSCRIBE_OK;
     };
 
-    const int n_full = n_chunks - n_chunks % kConvPassChunks;
+    // Chunks have independent convolution inputs and padding. Bound the live
+    // im2col/activation arena on the constrained profile while preserving every
+    // chunk and the original output order; one graph is reused across passes.
+    const int pass_chunks = khr_gpu_graph_policy(cc) ? 1 : kConvPassChunks;
+    if (khr_gpu_graph_policy(cc)) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "qwen3_asr KHR subsample: chunks=%d pass_chunks=%d",
+                n_chunks, pass_chunks);
+    }
+    const int n_full = n_chunks - n_chunks % pass_chunks;
     if (n_full > 0) {
-        if (const transcribe_status st = run_passes(kConvPassChunks, 0, n_full); st != TRANSCRIBE_OK) {
+        if (const transcribe_status st = run_passes(pass_chunks, 0, n_full); st != TRANSCRIBE_OK) {
             return st;
         }
     }
@@ -617,10 +856,19 @@ transcribe_status run_subsample(QwenAsrSession *     cc,
     return TRANSCRIBE_OK;
 }
 
-transcribe_status run(transcribe_session *          session,
-                      const float *                 pcm,
-                      int                           n_samples,
-                      const transcribe_run_params * params) {
+// Mel and conv stem already computed by the streaming path (stream_finalize):
+// run_impl skips both and starts at the encoder transformer.
+struct PrecomputedStem {
+    EncoderTiming      timing{};
+    std::vector<float> subsample;  // [d_model, per_chunk_aftercnn, n_chunks]
+    int64_t            t_subsample_us = 0;
+};
+
+transcribe_status run_impl(transcribe_session *          session,
+                           const float *                 pcm,
+                           int                           n_samples,
+                           const transcribe_run_params * params,
+                           PrecomputedStem *             pre) {
     if (session == nullptr || pcm == nullptr || n_samples <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -650,6 +898,18 @@ transcribe_status run(transcribe_session *          session,
         }
         lang_prefix_ptr = &lang_prefix_ids;
     }
+    // Experiment (TRANSCRIBE_QWEN3_FORCE_LAST_HEADER, off by default): with
+    // no hint but a context prompt (a later phrase of an utterance), force
+    // the header the last auto-detect run generated instead of detecting.
+    // Unlike the header draft, nothing checks it against the audio.
+    bool forced_last = false;
+    if (lang_prefix_ptr == nullptr && params != nullptr && params->prompt != nullptr && params->prompt[0] != '\0' &&
+        !cc->header_draft.empty() && prefix_cache_enabled() &&
+        transcribe::env::flag("TRANSCRIBE_QWEN3_FORCE_LAST_HEADER")) {
+        lang_prefix_ids = cc->header_draft;
+        lang_prefix_ptr = &lang_prefix_ids;
+        forced_last     = true;
+    }
 
     transcribe::debug::init();
 
@@ -658,29 +918,33 @@ transcribe_status run(transcribe_session *          session,
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: model has no MelFrontend");
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
-    const int64_t t_mel_start  = ggml_time_us();
-    int           mel_n_mels   = 0;
-    int           mel_n_frames = 0;
-    if (const transcribe_status mst =
-            cm->mel->compute(pcm, static_cast<size_t>(n_samples), cc->mel_buf, mel_n_mels, mel_n_frames, cc->n_threads);
-        mst != TRANSCRIBE_OK) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: MelFrontend::compute failed (%s)",
-                transcribe_status_string(mst));
-        return mst;
+    const int64_t t_mel_start  = INT64_C(0);
+    int           mel_n_mels   = cm->mel->num_mels();
+    int           mel_n_frames = (pre != nullptr) ? pre->timing.n_mel_frames : 0;
+    if (pre == nullptr) {
+        if (const transcribe_status mst = cm->mel->compute(pcm, static_cast<size_t>(n_samples), cc->mel_buf,
+                                                           mel_n_mels, mel_n_frames, cc->n_threads);
+            mst != TRANSCRIBE_OK) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: MelFrontend::compute failed (%s)",
+                    transcribe_status_string(mst));
+            return mst;
+        }
+        cc->t_mel_us = INT64_C(0) - t_mel_start;
     }
-    cc->t_mel_us = ggml_time_us() - t_mel_start;
 
     // Dump the post-frontend mel in the reference's contract shape
     // [n_mels, T_mel]. The batched graph input is a reshaped view of
-    // the same data, so the comparison point lives on the host.
-    if (transcribe::debug::enabled()) {
+    // the same data, so the comparison point lives on the host. (The
+    // streaming path fills mel_buf for this only when dumping.)
+    if (transcribe::debug::enabled() &&
+        cc->mel_buf.size() == static_cast<size_t>(mel_n_mels) * static_cast<size_t>(mel_n_frames)) {
         const long long shape[2] = { mel_n_mels, mel_n_frames };
         transcribe::debug::dump_host_f32("enc.mel.in", cc->mel_buf.data(), static_cast<long long>(cc->mel_buf.size()),
                                          shape, 2, "frontend.mel.norm");
     }
 
     // Compute encoder timing + reject unsupported shapes.
-    EncoderTiming timing = compute_encoder_timing(mel_n_frames, cm->hparams);
+    EncoderTiming timing = (pre != nullptr) ? pre->timing : compute_encoder_timing(mel_n_frames, cm->hparams);
     if (timing.n_chunks <= 0) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                 "qwen3_asr run: encoder timing is degenerate "
@@ -710,7 +974,7 @@ transcribe_status run(transcribe_session *          session,
     // per-run cost (graph build, sched alloc, uploads, prefill compute)
     // that the public transcribe_timings (mel/encode/decode) doesn't
     // expose, for the TRANSCRIBE_PERF_DEBUG breakdown.
-    const int64_t t_enc_build_start    = ggml_time_us();
+    const int64_t t_enc_build_start    = INT64_C(0);
     int64_t       t_enc_build_us       = 0;
     int64_t       t_enc_d2h_us         = 0;
     int64_t       t_prefill_build_us   = 0;
@@ -726,7 +990,8 @@ transcribe_status run(transcribe_session *          session,
 
     {
         ggml_init_params ip{};
-        ip.mem_size     = 16 * 1024 * 1024;
+        ip.mem_size     = compute_metadata_bytes(cc, 16 * 1024 * 1024, pre ? 0 : timing.n_chunks, true, 16384);
+        if (!ip.mem_size) return TRANSCRIBE_ERR_OOM;
         ip.mem_buffer   = nullptr;
         ip.no_alloc     = true;
         cc->compute_ctx = ggml_init(ip);
@@ -748,22 +1013,49 @@ transcribe_status run(transcribe_session *          session,
     // Conv subsampler, in passes of up to kConvPassChunks chunks.
     std::vector<float> subsample_host;
     int64_t            t_subsample_us = 0;
-    {
+    if (pre != nullptr) {
+        subsample_host = std::move(pre->subsample);
+        t_subsample_us = pre->t_subsample_us;
+    } else {
         std::vector<float> mel_batched;
         pack_mel_chunks(cc->mel_buf.data(), mel_n_mels, mel_n_frames, timing, mel_batched);
-        const int64_t t_sub0 = ggml_time_us();
+        const int64_t t_sub0 = INT64_C(0);
         if (const transcribe_status st = run_subsample(cc, cm, mel_batched.data(), timing.n_chunks, subsample_host);
             st != TRANSCRIBE_OK) {
             return st;
         }
-        t_subsample_us = ggml_time_us() - t_sub0;
+        t_subsample_us = INT64_C(0) - t_sub0;
     }
+
+    // Subsample outputs are complete in host storage; no later graph uses its arena.
+    if (const auto st = release_subsample_scratch(cc); st != TRANSCRIBE_OK) return st;
 
     // Build encoder graph.
     EncoderBuild eb = build_encoder_graph(cc->compute_ctx, cm->weights, cm->hparams, timing, cc->encoder_use_flash);
     if (eb.graph == nullptr || eb.out == nullptr) {
         return TRANSCRIBE_ERR_GGUF;
     }
+
+    std::unique_ptr<ggml_backend_buffer, decltype(&transcribe::safe_buffer_free)> encoder_handoff(
+        nullptr, &transcribe::safe_buffer_free);
+    if (khr_gpu_graph_policy(cc)) {
+        if (eb.out->view_src || !ggml_is_contiguous(eb.out) || eb.out->type != GGML_TYPE_F32)
+            return TRANSCRIBE_ERR_BACKEND;
+        const auto buft = ggml_backend_get_default_buffer_type(cm->plan.primary);
+        const size_t bytes = ggml_backend_buft_get_alloc_size(buft, eb.out);
+        encoder_handoff.reset(ggml_backend_alloc_buffer(cm->plan.primary, bytes));
+        if (!encoder_handoff) return TRANSCRIBE_ERR_OOM;
+        if (ggml_backend_tensor_alloc(encoder_handoff.get(), eb.out,
+                                     ggml_backend_buffer_get_base(encoder_handoff.get())) != GGML_STATUS_SUCCESS)
+            return TRANSCRIBE_ERR_BACKEND;
+    }
+    const auto bind_encoder_input = [&](ggml_tensor * input) {
+        if (!encoder_handoff) return true;
+        if (!input || input->view_src || !ggml_are_same_shape(input, eb.out) ||
+            input->type != eb.out->type || !ggml_is_contiguous(input)) return false;
+        return ggml_backend_tensor_alloc(encoder_handoff.get(), input,
+                   ggml_backend_buffer_get_base(encoder_handoff.get())) == GGML_STATUS_SUCCESS;
+    };
 
     // Allocate + compute encoder graph.
     ggml_backend_sched_reset(cc->sched);
@@ -774,6 +1066,7 @@ transcribe_status run(transcribe_session *          session,
     }
 
     ggml_backend_tensor_set(eb.subsample_in, subsample_host.data(), 0, subsample_host.size() * sizeof(float));
+    if (khr_gpu_graph_policy(cc)) std::vector<float>().swap(subsample_host);
 
     // Positional embedding.
     {
@@ -783,13 +1076,13 @@ transcribe_status run(transcribe_session *          session,
 
     transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
 
-    const int64_t t_enc_start = ggml_time_us();
+    const int64_t t_enc_start = INT64_C(0);
     t_enc_build_us            = t_enc_start - t_enc_build_start - t_subsample_us;
-    if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
+    if (const ggml_status gs = compute_qwen_graph(cc, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: encoder graph compute failed (%d)", static_cast<int>(gs));
         return TRANSCRIBE_ERR_BACKEND;
     }
-    cc->t_encode_us = ggml_time_us() - t_enc_start + t_subsample_us;
+    cc->t_encode_us = INT64_C(0) - t_enc_start + t_subsample_us;
 
     // Dump encoder intermediates.
     auto try_dump = [](const char * name, ggml_tensor * t, const char * stage) {
@@ -808,20 +1101,24 @@ transcribe_status run(transcribe_session *          session,
     try_dump("enc.ln_post.out", eb.dumps.ln_post_out, "enc.ln_post");
     try_dump("enc.proj.out", eb.dumps.proj_out, "enc.proj");
 
-    // Read encoder output to host for the LM prefill. The graph already
+    // Preserve encoder output across the encoder/prefill scheduler reset. The graph already
     // dropped the aftercnn pad rows (see encoder.cpp), so eb.out is exactly
     // [d_enc, T_enc] — the reference's `padded_embed[padded_mask_after_cnn]`
     // shape.
     const int d_enc = static_cast<int>(eb.out->ne[0]);
     const int T_enc = static_cast<int>(eb.out->ne[1]);
-    cc->enc_host.resize(static_cast<size_t>(d_enc) * static_cast<size_t>(T_enc));
-    const int64_t t_d2h_start = ggml_time_us();
-    ggml_backend_tensor_get(eb.out, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
-    t_enc_d2h_us = ggml_time_us() - t_d2h_start;
+    if (encoder_handoff) {
+        std::vector<float>().swap(cc->enc_host);
+    } else {
+        cc->enc_host.resize(static_cast<size_t>(d_enc) * static_cast<size_t>(T_enc));
+        const int64_t t_d2h_start = INT64_C(0);
+        ggml_backend_tensor_get(eb.out, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
+        t_enc_d2h_us = INT64_C(0) - t_d2h_start;
+    }
 
     // Decode phase begins. t_dec_start covers prompt + KV init + prefill
     // build/compute + step loop (prefill is part of "decode" to users).
-    const int64_t t_dec_start           = ggml_time_us();
+    const int64_t t_dec_start           = INT64_C(0);
     const int64_t t_prefill_build_start = t_dec_start;
 
     // Prompt construction.
@@ -860,16 +1157,39 @@ transcribe_status run(transcribe_session *          session,
     // graph's flash-attn path wants pow2 attention width). A pre-allocated
     // smaller cache is freed and re-allocated.
     int want_n_ctx = 1024;
-    while (want_n_ctx < T_prompt + max_new) {
-        want_n_ctx *= 2;
+    if (khr_gpu_graph_policy(cc)) {
+        want_n_ctx = static_cast<int>(std::min<int64_t>(ceiling,
+            ((static_cast<int64_t>(T_prompt) + max_new + 15) / 16) * 16));
+    } else {
+        while (want_n_ctx < T_prompt + max_new) {
+            want_n_ctx *= 2;
+        }
     }
     if (want_n_ctx > ceiling) {
         want_n_ctx = ceiling;
     }
+    const int kv_capacity_limit = want_n_ctx;
+    if (khr_gpu_graph_policy(cc)) {
+        const int64_t draft_room = std::min<int64_t>(max_new, std::max<size_t>(1, cc->header_draft.size()));
+        want_n_ctx = initial_khr_kv_capacity(static_cast<int64_t>(T_prompt) + draft_room, kv_capacity_limit);
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
+                "qwen3_asr KHR KV request: prompt=%d decode_budget=%d capacity=%d limit=%d retained=%d",
+                T_prompt, max_new, want_n_ctx, kv_capacity_limit, cc->kv_cache.n_ctx);
+    }
+    // Prompt-prefix cache: rows [0, n_past) of the KV cache already hold this
+    // prompt's first n_past tokens from an earlier run (the chat frame and
+    // the system context, both before the audio), so only the rest is
+    // prefilled. The audio and everything after it are always new.
+    const bool reuse = prefix_cache_enabled();
     if (cc->kv_cache.ctx != nullptr && cc->kv_cache.n_ctx < want_n_ctx) {
-        cc->kv_cache.free();
+        if (khr_gpu_graph_policy(cc)) {
+            if (const auto st = grow_khr_kv(cc, want_n_ctx); st != TRANSCRIBE_OK) return st;
+        } else {
+            cc->kv_cache.free();
+        }
     }
     if (cc->kv_cache.ctx == nullptr) {
+        clear_prefix_cache(cc);
         ggml_type kv_type = GGML_TYPE_F16;
         if (cc->kv_type == TRANSCRIBE_KV_TYPE_F32) {
             kv_type = GGML_TYPE_F32;
@@ -884,97 +1204,47 @@ transcribe_status run(transcribe_session *          session,
                                 cm->hparams.dec_n_layers);
             return TRANSCRIBE_ERR_OOM;
         }
-    } else {
+    } else if (!reuse) {
         // Clear stale positions for a fresh prefill.
+        clear_prefix_cache(cc);
         if (cc->kv_cache.buffer != nullptr) {
             ggml_backend_buffer_clear(cc->kv_cache.buffer, 0);
         }
         cc->kv_cache.n    = 0;
         cc->kv_cache.head = 0;
     }
-
-    // Prefill graph. slice_last false: last block's FFN + final norm run on
-    // every position (needed for dump parity). true: slice to just the final
-    // position before the last FFN (llama.cpp's inp_out_ids trick, ~25 ms).
-    const bool   dumps_on   = transcribe::debug::enabled();
-    const bool   slice_last = !dumps_on;
-    PrefillBuild pb = build_prefill_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, T_prompt, T_enc,
-                                          prefix_len, suffix_len,
-                                          /*use_flash=*/cc->decoder_use_flash, slice_last);
-    if (pb.graph == nullptr || pb.out == nullptr) {
-        return TRANSCRIBE_ERR_GGUF;
+    // Stale rows past n_past need no clearing: every attention mask here
+    // excludes them (-inf), and the step loop writes each row before reading it.
+    // Every row is computed on the attention path the single prefill graph
+    // over this prompt would take, so the result does not depend on which
+    // rows came from the cache.
+    const bool ref_tiled = T_prompt >= k_fa_tile_rows;
+    const int  n_past    = reuse ? common_prefix(cc, prompt_ids.data(), prefix_len, ref_tiled) : 0;
+    if (khr_gpu_graph_policy(cc) && transcribe::env::flag("TRANSCRIBE_RESOURCE_DIAGNOSTICS")) {
+        std::fprintf(stderr, "ASR_PREFIX_REUSE requested=%d reused=%d valid=%d head=%d capacity=%d\n",
+                     prefix_len, n_past, cc->kv_cache.n, cc->kv_cache.head, cc->kv_cache.n_ctx);
     }
-
-    // Allocate + compute prefill on the same scheduler.
-    ggml_backend_sched_reset(cc->sched);
-    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, pb.graph, "qwen3_asr")) {
-        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                            "qwen3_asr run: prefill graph allocation failed (T_prompt=%d) — "
-                            "out of memory. Lower transcribe_session_params.n_ctx or shorten "
-                            "the audio.",
-                            T_prompt);
-        return TRANSCRIBE_ERR_OOM;
+    // Header draft: the previous auto-detect run's "language X<asr_text>" ids,
+    // appended to the prompt; the prefill's logits at those positions show
+    // how many of them the model predicts itself (greedy), and those are
+    // taken as generated, saving a decode step each.
+    std::vector<int32_t> draft;
+    if (lang_prefix_ptr == nullptr && header_draft_enabled() &&
+        static_cast<int>(cc->header_draft.size()) + 1 < max_new &&
+        T_prompt + static_cast<int>(cc->header_draft.size()) <= cc->kv_cache.n_ctx) {
+        draft = cc->header_draft;
     }
+    const int n_draft = static_cast<int>(draft.size());
+    cc->kv_reused    = n_past;
+    cc->kv_prefilled = T_prompt - n_past;
+    cc->draft_n      = n_draft;
+    cc->draft_ok     = 0;
 
-    // Upload prefill inputs.
-    ggml_backend_tensor_set(pb.input_ids_in, prompt_ids.data(), 0, prompt_ids.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(pb.enc_out_in, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
-
-    {
-        std::vector<int32_t> positions(T_prompt);
-        for (int i = 0; i < T_prompt; ++i) {
-            positions[i] = i;
-        }
-        ggml_backend_tensor_set(pb.positions_in, positions.data(), 0, positions.size() * sizeof(int32_t));
-    }
-
-    {
-        // Causal mask in F16 (matches pb.mask_in): row r col c is 0 if c <= r,
-        // else -inf, row-major. F16 upload avoids a per-layer ggml_cast.
-        const ggml_fp16_t        mask_zero    = ggml_fp32_to_fp16(0.0f);
-        const ggml_fp16_t        mask_neg_inf = ggml_fp32_to_fp16(-INFINITY);
-        std::vector<ggml_fp16_t> mask(static_cast<size_t>(T_prompt) * T_prompt, mask_neg_inf);
-        for (int r = 0; r < T_prompt; ++r) {
-            for (int c = 0; c <= r; ++c) {
-                mask[static_cast<size_t>(r) * T_prompt + c] = mask_zero;
-            }
-        }
-        ggml_backend_tensor_set(pb.mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-    }
-
-    const int64_t t_prefill_compute_start = ggml_time_us();
-    t_prefill_build_us                    = t_prefill_compute_start - t_prefill_build_start;
-    if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, pb.graph); gs != GGML_STATUS_SUCCESS) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: prefill graph compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_BACKEND;
-    }
-    t_prefill_compute_us = ggml_time_us() - t_prefill_compute_start;
-
-    cc->kv_cache.n    = T_prompt;
-    cc->kv_cache.head = T_prompt;
-
-    // Dump dec.* intermediates.
-    try_dump("dec.token_emb", pb.dumps.token_emb, "dec.token_emb");
-    try_dump("dec.audio_injected", pb.dumps.audio_injected, "dec.audio_injected");
-    try_dump("dec.block.0.out", pb.dumps.block_0_out, "dec.block.0");
-    {
-        char nm[64];
-        std::snprintf(nm, sizeof(nm), "dec.block.%d.out", cm->hparams.dec_n_layers - 1);
-        try_dump(nm, pb.dumps.block_last_out, "dec.block.last");
-    }
-    try_dump("dec.out_before_head", pb.dumps.out_before_head, "dec.out_before_head");
-    try_dump("dec.logits_raw", pb.dumps.logits_raw, "dec.logits_raw");
-
-    // Read prefill logits + first argmax.
-    const int64_t      t_prefill_logits_start = ggml_time_us();
-    const int          vocab                  = cm->hparams.dec_vocab_size;
-    std::vector<float> logits(vocab);
-    ggml_backend_tensor_get(pb.out, logits.data(), 0, logits.size() * sizeof(float));
-
-    auto argmax = [&](const std::vector<float> & v) -> int32_t {
+    const int vocab  = cm->hparams.dec_vocab_size;
+    auto      argmax = [](const float * v, int n) -> int32_t {
         int32_t best   = 0;
         float   best_v = v[0];
-        for (int32_t i = 1; i < static_cast<int32_t>(v.size()); ++i) {
+        for (int32_t i = 1; i < n; ++i) {
             if (v[i] > best_v) {
                 best_v = v[i];
                 best   = i;
@@ -982,15 +1252,181 @@ transcribe_status run(transcribe_session *          session,
         }
         return best;
     };
-
     std::vector<int32_t> generated_ids;
-    int32_t              next_tok = argmax(logits);
-    generated_ids.push_back(next_tok);
-    t_prefill_logits_us = ggml_time_us() - t_prefill_logits_start;
+    float                logit0_max = 0.0f;  // perf log: max logit after the prompt (bitwise checks)
+    int32_t              next_tok = 0;
+    int                  n_accepted = 0;  // header draft tokens taken as generated
+
+    if (n_past == 0 && n_draft == 0) {
+        // Prefill graph. slice_last false: last block's FFN + final norm run on
+        // every position (needed for dump parity). true: slice to just the final
+        // position before the last FFN (llama.cpp's inp_out_ids trick, ~25 ms).
+        const bool   dumps_on   = transcribe::debug::enabled();
+        const bool   slice_last = !dumps_on;
+        PrefillBuild pb = build_prefill_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, T_prompt, T_enc,
+                                              prefix_len, suffix_len,
+                                              /*use_flash=*/cc->decoder_use_flash, slice_last);
+        if (pb.graph == nullptr || pb.out == nullptr) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+
+        // Allocate + compute prefill on the same scheduler.
+        if (!bind_encoder_input(pb.enc_out_in)) return TRANSCRIBE_ERR_BACKEND;
+        ggml_backend_sched_reset(cc->sched);
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, pb.graph, "qwen3_asr")) {
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                "qwen3_asr run: prefill graph allocation failed (T_prompt=%d) — "
+                                "out of memory. Lower transcribe_session_params.n_ctx or shorten "
+                                "the audio.",
+                                T_prompt);
+            return TRANSCRIBE_ERR_OOM;
+        }
+
+        // Upload prefill inputs.
+        ggml_backend_tensor_set(pb.input_ids_in, prompt_ids.data(), 0, prompt_ids.size() * sizeof(int32_t));
+        if (!encoder_handoff)
+            ggml_backend_tensor_set(pb.enc_out_in, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
+
+        {
+            std::vector<int32_t> positions(T_prompt);
+            for (int i = 0; i < T_prompt; ++i) {
+                positions[i] = i;
+            }
+            ggml_backend_tensor_set(pb.positions_in, positions.data(), 0, positions.size() * sizeof(int32_t));
+        }
+
+        {
+            // Causal mask in F16 (matches pb.mask_in): row r col c is 0 if c <= r,
+            // else -inf, row-major. F16 upload avoids a per-layer ggml_cast.
+            const ggml_fp16_t        mask_zero    = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t        mask_neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            std::vector<ggml_fp16_t> mask(static_cast<size_t>(T_prompt) * T_prompt, mask_neg_inf);
+            for (int r = 0; r < T_prompt; ++r) {
+                for (int c = 0; c <= r; ++c) {
+                    mask[static_cast<size_t>(r) * T_prompt + c] = mask_zero;
+                }
+            }
+            ggml_backend_tensor_set(pb.mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        }
+
+        const int64_t t_prefill_compute_start = INT64_C(0);
+        t_prefill_build_us                    = t_prefill_compute_start - t_prefill_build_start;
+        if (const ggml_status gs = compute_qwen_graph(cc, pb.graph); gs != GGML_STATUS_SUCCESS) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: prefill graph compute failed (%d)", static_cast<int>(gs));
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+        t_prefill_compute_us = INT64_C(0) - t_prefill_compute_start;
+
+        cc->kv_cache.n    = T_prompt;
+        cc->kv_cache.head = T_prompt;
+
+        // Dump dec.* intermediates.
+        try_dump("dec.token_emb", pb.dumps.token_emb, "dec.token_emb");
+        try_dump("dec.audio_injected", pb.dumps.audio_injected, "dec.audio_injected");
+        try_dump("dec.block.0.out", pb.dumps.block_0_out, "dec.block.0");
+        {
+            char nm[64];
+            std::snprintf(nm, sizeof(nm), "dec.block.%d.out", cm->hparams.dec_n_layers - 1);
+            try_dump(nm, pb.dumps.block_last_out, "dec.block.last");
+        }
+        try_dump("dec.out_before_head", pb.dumps.out_before_head, "dec.out_before_head");
+        try_dump("dec.logits_raw", pb.dumps.logits_raw, "dec.logits_raw");
+
+        // Read prefill logits + first argmax.
+        const int64_t      t_prefill_logits_start = INT64_C(0);
+        std::vector<float> logits(vocab);
+        ggml_backend_tensor_get(pb.out, logits.data(), 0, logits.size() * sizeof(float));
+
+
+        next_tok = argmax(logits.data(), vocab);
+        logit0_max = logits[next_tok];
+        generated_ids.push_back(next_tok);
+        t_prefill_logits_us = INT64_C(0) - t_prefill_logits_start;
+    } else {
+        // Prefill [n_past, T_prompt + n_draft) on top of the cached rows.
+        // (Debug dumps of decoder intermediates are on the path above only.)
+        const int T_full   = T_prompt + n_draft;
+        const int T_chunk  = T_full - n_past;
+        const int n_logits = 1 + n_draft;
+        cc->kv_ids.resize(static_cast<size_t>(n_past));  // rows past n_past are rewritten below
+        cc->kv_tiled.resize(static_cast<size_t>(n_past));
+
+        std::vector<int32_t> full_ids(prompt_ids);
+        full_ids.insert(full_ids.end(), draft.begin(), draft.end());
+
+        PrefillChunkBuild pb =
+            build_prefill_chunk_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, T_chunk, T_full,
+                                      prefix_len - n_past, T_enc, suffix_len + n_draft, n_logits,
+                                      /*use_flash=*/cc->decoder_use_flash, chunk_fa_q_rows(T_chunk, ref_tiled));
+        if (pb.graph == nullptr || pb.out == nullptr) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        if (!bind_encoder_input(pb.enc_out_in)) return TRANSCRIBE_ERR_BACKEND;
+        ggml_backend_sched_reset(cc->sched);
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, pb.graph, "qwen3_asr")) {
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                "qwen3_asr run: prefill graph allocation failed (T_prompt=%d) — "
+                                "out of memory. Lower transcribe_session_params.n_ctx or shorten "
+                                "the audio.",
+                                T_prompt);
+            return TRANSCRIBE_ERR_OOM;
+        }
+        if (pb.input_ids_in != nullptr) {
+            ggml_backend_tensor_set(pb.input_ids_in, full_ids.data() + n_past, 0,
+                                    static_cast<size_t>(T_chunk) * sizeof(int32_t));
+        }
+        if (!encoder_handoff)
+            ggml_backend_tensor_set(pb.enc_out_in, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
+        {
+            std::vector<int32_t> positions(T_chunk);
+            std::vector<int64_t> kv_idx(T_chunk);
+            for (int i = 0; i < T_chunk; ++i) {
+                positions[i] = n_past + i;
+                kv_idx[i]    = n_past + i;
+            }
+            ggml_backend_tensor_set(pb.positions_in, positions.data(), 0, positions.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(pb.kv_idx_in, kv_idx.data(), 0, kv_idx.size() * sizeof(int64_t));
+        }
+        set_chunk_mask(pb, T_full, T_chunk, n_past);
+
+        const int64_t t_prefill_compute_start = INT64_C(0);
+        t_prefill_build_us                    = t_prefill_compute_start - t_prefill_build_start;
+        if (const ggml_status gs = compute_qwen_graph(cc, pb.graph); gs != GGML_STATUS_SUCCESS) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: prefill graph compute failed (%d)",
+                    static_cast<int>(gs));
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+        t_prefill_compute_us = INT64_C(0) - t_prefill_compute_start;
+
+        // Logits row j predicts position T_prompt + j: keep the draft while
+        // the model agrees with it, then its own token.
+        const int64_t      t_prefill_logits_start = INT64_C(0);
+        std::vector<float> logits(static_cast<size_t>(vocab) * n_logits);
+        ggml_backend_tensor_get(pb.out, logits.data(), 0, logits.size() * sizeof(float));
+        logit0_max = logits[argmax(logits.data(), vocab)];
+        while (n_accepted < n_draft &&
+               argmax(logits.data() + static_cast<size_t>(vocab) * n_accepted, vocab) == draft[n_accepted]) {
+            generated_ids.push_back(draft[n_accepted]);
+            ++n_accepted;
+        }
+        next_tok = argmax(logits.data() + static_cast<size_t>(vocab) * n_accepted, vocab);
+        generated_ids.push_back(next_tok);
+        t_prefill_logits_us = INT64_C(0) - t_prefill_logits_start;
+
+        cc->kv_cache.n    = T_prompt + n_accepted;
+        cc->kv_cache.head = T_prompt + n_accepted;
+        cc->draft_ok      = n_accepted;
+    }
+    encoder_handoff.reset();
+    if (reuse) {
+        cc->kv_ids.assign(prompt_ids.begin(), prompt_ids.begin() + prefix_len);
+        cc->kv_tiled.assign(static_cast<size_t>(prefix_len), ref_tiled ? 1 : 0);
+    }
+    cc->t_prefill_us = t_prefill_build_us + t_prefill_compute_us + t_prefill_logits_us;
 
     // Step loop.
     const int32_t eos_id   = cm->hparams.eos_token_id;
-    int           cur_past = T_prompt;
+    int           cur_past = T_prompt + n_accepted;
 
     // Build the step graph ONCE and reuse every step, sized for the actual
     // workload (T_prompt written + up to max_new generated). Metal's flash-attn
@@ -1003,52 +1439,61 @@ transcribe_status run(transcribe_session *          session,
     if (max_n_kv > cc->kv_cache.n_ctx) {
         max_n_kv = cc->kv_cache.n_ctx;
     }
-    const int64_t t_step_build_start = ggml_time_us();
-    if (cc->compute_ctx != nullptr) {
-        ggml_free(cc->compute_ctx);
-        cc->compute_ctx = nullptr;
-    }
-    {
-        ggml_init_params ip{};
-        ip.mem_size     = 8 * 1024 * 1024;
-        ip.mem_buffer   = nullptr;
-        ip.no_alloc     = true;
-        cc->compute_ctx = ggml_init(ip);
-        if (cc->compute_ctx == nullptr) {
-            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                "qwen3_asr step: compute context allocation failed — "
-                                "out of memory.");
-            return TRANSCRIBE_ERR_OOM;
+    if (khr_gpu_graph_policy(cc)) max_n_kv = std::min(cc->kv_cache.n_ctx, kv_capacity_limit);
+    const int step_capacity_limit = khr_gpu_graph_policy(cc) ? kv_capacity_limit : max_n_kv;
+    const int64_t t_step_build_start = INT64_C(0);
+    const ggml_fp16_t mask_zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t mask_neg_inf = ggml_fp32_to_fp16(-INFINITY);
+    StepBuild sb{};
+    std::vector<ggml_fp16_t> step_mask;
+    bool mask_needs_prefix = true;
+    auto rebuild_step_graph = [&]() -> transcribe_status {
+        if (cc->compute_ctx != nullptr) {
+            ggml_free(cc->compute_ctx);
+            cc->compute_ctx = nullptr;
         }
-    }
-    StepBuild sb = build_step_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, max_n_kv,
-                                    /*use_flash=*/cc->decoder_use_flash);
-    if (sb.graph == nullptr || sb.out == nullptr) {
-        return TRANSCRIBE_ERR_GGUF;
-    }
-    ggml_backend_sched_reset(cc->sched);
-    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, sb.graph, "qwen3_asr")) {
-        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                            "qwen3_asr step: decode graph allocation failed — out of memory. "
-                            "Lower transcribe_session_params.n_ctx or shorten the audio.");
-        return TRANSCRIBE_ERR_OOM;
-    }
-    const int64_t t_step_build_once_us = ggml_time_us() - t_step_build_start;
-
-    // Mask buffer reused host-side across steps. Starts all -inf; per step we
-    // zero positions [0, cur_past] (attend) and leave the rest -inf.
-    const ggml_fp16_t        mask_zero    = ggml_fp32_to_fp16(0.0f);
-    const ggml_fp16_t        mask_neg_inf = ggml_fp32_to_fp16(-INFINITY);
-    std::vector<ggml_fp16_t> step_mask(max_n_kv, mask_neg_inf);
+        ggml_init_params ip{};
+        ip.mem_size = compute_metadata_bytes(cc, 8 * 1024 * 1024, 0, false, 8192);
+        if (!ip.mem_size) return TRANSCRIBE_ERR_OOM;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc = true;
+        cc->compute_ctx = ggml_init(ip);
+        if (!cc->compute_ctx) return TRANSCRIBE_ERR_OOM;
+        sb = build_step_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, max_n_kv,
+                              /*use_flash=*/cc->decoder_use_flash);
+        if (!sb.graph || !sb.out) return TRANSCRIBE_ERR_GGUF;
+        ggml_backend_sched_reset(cc->sched);
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, sb.graph, "qwen3_asr")) return TRANSCRIBE_ERR_OOM;
+        step_mask.assign(max_n_kv, mask_neg_inf);
+        mask_needs_prefix = true;
+        return TRANSCRIBE_OK;
+    };
+    if (const auto st = rebuild_step_graph(); st != TRANSCRIBE_OK) return st;
+    const int64_t t_step_build_once_us = INT64_C(0) - t_step_build_start;
 
     // Per-step timers.
     int64_t       t_step_set_us     = 0;
     int64_t       t_step_comp_us    = 0;
     int64_t       t_step_get_us     = 0;
-    const int64_t t_step_loop_start = ggml_time_us();
+    const int64_t t_step_loop_start = INT64_C(0);
     bool          repeating         = false;
-    while (next_tok != eos_id && static_cast<int32_t>(generated_ids.size()) < max_new && cur_past + 1 <= max_n_kv) {
-        const int64_t t_set0 = ggml_time_us();
+    const bool warming = active_warmup && active_warmup->session == session;
+    while ((next_tok != eos_id || warming) && static_cast<int32_t>(generated_ids.size()) < max_new &&
+           cur_past + 1 <= step_capacity_limit) {
+        if (cur_past >= max_n_kv) {
+            ggml_backend_sched_synchronize(cc->sched);
+            ggml_backend_sched_reset(cc->sched);
+            sb = {};
+            ggml_free(cc->compute_ctx);
+            cc->compute_ctx = nullptr;
+            const int capacity = static_cast<int>(std::min<int64_t>(step_capacity_limit,
+                std::max<int64_t>(static_cast<int64_t>(cur_past) + 1,
+                                  static_cast<int64_t>(cc->kv_cache.n_ctx) * 2)));
+            if (const auto st = grow_khr_kv(cc, capacity); st != TRANSCRIBE_OK) return st;
+            max_n_kv = cc->kv_cache.n_ctx;
+            if (const auto st = rebuild_step_graph(); st != TRANSCRIBE_OK) return st;
+        }
+        const int64_t t_set0 = INT64_C(0);
 
         ggml_backend_tensor_set(sb.input_id_in, &next_tok, 0, sizeof(int32_t));
         const int32_t pos_val = cur_past;
@@ -1059,21 +1504,22 @@ transcribe_status run(transcribe_session *          session,
         // Mask: mark the newly-added position as attendable. Positions
         // [0, cur_past) were zeroed in prior iterations; just set the
         // new one. (On iter 0, zero everything in [0, cur_past].)
-        if (cur_past == T_prompt) {
+        if (mask_needs_prefix) {
             std::fill(step_mask.begin(), step_mask.begin() + cur_past + 1, mask_zero);
+            mask_needs_prefix = false;
         } else {
             step_mask[cur_past] = mask_zero;
         }
         ggml_backend_tensor_set(sb.mask_in, step_mask.data(), 0, static_cast<size_t>(max_n_kv) * sizeof(ggml_fp16_t));
 
-        const int64_t t_set1 = ggml_time_us();
+        const int64_t t_set1 = INT64_C(0);
         t_step_set_us += t_set1 - t_set0;
 
-        if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, sb.graph); gs != GGML_STATUS_SUCCESS) {
+        if (const ggml_status gs = compute_qwen_graph(cc, sb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr step: graph compute failed (%d)", static_cast<int>(gs));
             return TRANSCRIBE_ERR_BACKEND;
         }
-        const int64_t t_comp1 = ggml_time_us();
+        const int64_t t_comp1 = INT64_C(0);
         t_step_comp_us += t_comp1 - t_set1;
 
         int32_t argmax_tok = 0;
@@ -1083,15 +1529,38 @@ transcribe_status run(transcribe_session *          session,
         cur_past += 1;
         cc->kv_cache.n    = cur_past + 1;
         cc->kv_cache.head = cur_past + 1;
-        t_step_get_us += ggml_time_us() - t_comp1;
+        t_step_get_us += INT64_C(0) - t_comp1;
+        if (warming) {
+            ++active_warmup->completed_steps;
+            if (transcribe::env::flag("TRANSCRIBE_RESOURCE_DIAGNOSTICS")) {
+                std::fprintf(stderr, "ASR_WARMUP_STEP mode=%s completed=1\n",
+                             active_warmup->streaming ? "streaming" : "offline");
+            }
+            break;
+        }
         if (next_tok != eos_id && transcribe::stop_on_repetition(generated_ids, "qwen3_asr run")) {
             cc->mark_repetition_stop();
             repeating = true;
             break;
         }
     }
-    t_step_loop_us = ggml_time_us() - t_step_loop_start;
-    n_steps        = static_cast<int>(generated_ids.size()) - 1;
+    if (warming) {
+        return active_warmup->completed_steps == 1 ? TRANSCRIBE_OK : TRANSCRIBE_ERR_BACKEND;
+    }
+    t_step_loop_us = INT64_C(0) - t_step_loop_start;
+    n_steps        = static_cast<int>(generated_ids.size()) - 1 - n_accepted;
+
+    // The header this run generated, as the next run's draft.
+    if (lang_prefix_ptr == nullptr && prefix_cache_enabled()) {
+        cc->header_draft.clear();
+        const int asr_text_id = cm->tok.find("<asr_text>");
+        for (size_t i = 0; asr_text_id >= 0 && i < generated_ids.size() && i < 8; ++i) {
+            if (generated_ids[i] == asr_text_id) {
+                cc->header_draft.assign(generated_ids.begin(), generated_ids.begin() + static_cast<long>(i) + 1);
+                break;
+            }
+        }
+    }
 
     // Decode stopped at EOS (complete) or the generation budget / context width
     // (truncated). Surface the latter via transcribe_was_truncated() + WARN; a
@@ -1121,6 +1590,9 @@ transcribe_status run(transcribe_session *          session,
     // Decode generated ids to text (Tokenizer::decode handles the "gpt2"
     // byte-level inversion natively).
     std::string raw_text = cm->tok.decode(generated_ids.data(), static_cast<int>(generated_ids.size()));
+    if (forced_last) {  // report the forced header like a detected one
+        raw_text = cm->tok.decode(lang_prefix_ids.data(), static_cast<int>(lang_prefix_ids.size())) + raw_text;
+    }
     cc->raw_text         = raw_text;  // pre-envelope text, via transcribe_raw_text
 
     // Parse Qwen3-ASR output: auto-detect emits "language X<asr_text>text"
@@ -1132,7 +1604,7 @@ transcribe_status run(transcribe_session *          session,
         // detected_language (reverse-mapped to BCP-47), but only when the
         // caller did NOT supply a hint (the field reports what the model told
         // us, not what we told it).
-        if (lang_prefix_ptr == nullptr) {
+        if (lang_prefix_ptr == nullptr || forced_last) {
             constexpr const char k_prefix[] = "language ";
             const size_t         name_start = raw_text.find(k_prefix);
             if (name_start != std::string::npos && name_start < sep) {
@@ -1153,11 +1625,17 @@ transcribe_status run(transcribe_session *          session,
     }
 
     // Write full_text + a single segment (no timestamps; TIMESTAMPS_NONE).
-    cc->t_decode_us = ggml_time_us() - t_dec_start;
+    cc->t_decode_us = INT64_C(0) - t_dec_start;
 
     // Optional perf breakdown (finer split than the public mel/encode/decode
     // timings), gated on env var.
     if (transcribe::env::flag("TRANSCRIBE_PERF_DEBUG")) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+                "qwen3_asr prefill: T_prompt=%d audio=%d prefix=%d reused=%d prefilled=%d draft=%d/%d "
+                "prefill_ms=%.2f steps=%d step_ms=%.2f decode_ms=%.2f l0=%a",
+                T_prompt, T_enc, prefix_len, cc->kv_reused, cc->kv_prefilled + n_draft, cc->draft_ok, n_draft,
+                cc->t_prefill_us / 1000.0, n_steps, t_step_loop_us / 1000.0,
+                (INT64_C(0) - t_dec_start) / 1000.0, static_cast<double>(logit0_max));
         const double ms     = 1.0 / 1000.0;
         const double sum_ms = (cc->t_mel_us + t_enc_build_us + cc->t_encode_us + t_enc_d2h_us + t_prefill_build_us +
                                t_prefill_compute_us + t_prefill_logits_us + t_step_loop_us) *
@@ -1168,6 +1646,7 @@ transcribe_status run(transcribe_session *          session,
                 "  mel              %8.2f ms\n"
                 "  enc_build        %8.2f ms  (graph + sched + uploads)\n"
                 "  enc_compute      %8.2f ms\n"
+                "    conv_stem    %8.2f ms  (%d chunks)\n"
                 "  enc_d2h          %8.2f ms  (%d floats)\n"
                 "  prefill_build    %8.2f ms  (kv_init + prompt + graph + sched + uploads)\n"
                 "  prefill_compute  %8.2f ms  (T_prompt=%d)\n"
@@ -1181,7 +1660,8 @@ transcribe_status run(transcribe_session *          session,
                 "    tensor_get   %8.2f ms  (%.3f ms/step)\n"
                 "  ---\n"
                 "  sum              %8.2f ms",
-                cc->t_mel_us * ms, t_enc_build_us * ms, cc->t_encode_us * ms, t_enc_d2h_us * ms,
+                cc->t_mel_us * ms, t_enc_build_us * ms, cc->t_encode_us * ms, t_subsample_us * ms, timing.n_chunks,
+                t_enc_d2h_us * ms,
                 static_cast<int>(cc->enc_host.size()), t_prefill_build_us * ms, t_prefill_compute_us * ms, T_prompt,
                 t_prefill_logits_us * ms, vocab, t_step_loop_us * ms, n_steps, per_step_ms, t_step_ctx_us * ms,
                 (n_steps > 0) ? (t_step_ctx_us * ms / n_steps) : 0.0, t_step_build_us * ms,
@@ -1206,6 +1686,13 @@ transcribe_status run(transcribe_session *          session,
     return cc->truncation_status();
 }
 
+transcribe_status run(transcribe_session *          session,
+                      const float *                 pcm,
+                      int                           n_samples,
+                      const transcribe_run_params * params) {
+    return run_impl(session, pcm, n_samples, params, /*pre=*/nullptr);
+}
+
 // ===========================================================================
 // Offline batched decode (transcribe_run_batch)
 // ===========================================================================
@@ -1225,13 +1712,14 @@ void apply_sched_threads(QwenAsrSession * cc) {
 
 // Fresh per-utterance graph arena. Frees any prior compute_ctx and inits a
 // no_alloc metadata context of `mb` MiB.
-transcribe_status reset_compute_ctx(QwenAsrSession * cc, int mb) {
+transcribe_status reset_compute_ctx(QwenAsrSession * cc, int mb, size_t metadata_bytes = SIZE_MAX) {
     if (cc->compute_ctx != nullptr) {
         ggml_free(cc->compute_ctx);
         cc->compute_ctx = nullptr;
     }
     ggml_init_params ip{};
-    ip.mem_size     = static_cast<size_t>(mb) * 1024 * 1024;
+    ip.mem_size     = metadata_bytes == SIZE_MAX ? static_cast<size_t>(mb) * 1024 * 1024 : metadata_bytes;
+    if (!ip.mem_size) return TRANSCRIBE_ERR_OOM;
     ip.mem_buffer   = nullptr;
     ip.no_alloc     = true;
     cc->compute_ctx = ggml_init(ip);
@@ -1264,7 +1752,7 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
     if (n_threads <= 0) {
         n_threads = transcribe::default_n_threads();
     }
-    const int64_t t_mel0 = ggml_time_us();
+    const int64_t t_mel0 = INT64_C(0);
     transcribe::parallel_for_all(n, n_threads, [&](int b) {
         if (pcm[b] == nullptr || n_samples[b] <= 0) {
             return true;  // valid stays 0
@@ -1278,7 +1766,7 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
         valid[b]  = 1;
         return true;
     });
-    mel_us += ggml_time_us() - t_mel0;
+    mel_us += INT64_C(0) - t_mel0;
 
     // Per-utterance timing + packing geometry.
     std::vector<EncoderTiming> timings(n);
@@ -1348,13 +1836,16 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
                 }
             }
         }
-        const int64_t t_sub0 = ggml_time_us();
+        const int64_t t_sub0 = INT64_C(0);
         if (const transcribe_status st = run_subsample(cc, cm, packed.data(), n * n_chunks_max, subsample_host);
             st != TRANSCRIBE_OK) {
             return st;
         }
-        enc_us += ggml_time_us() - t_sub0;
+        enc_us += INT64_C(0) - t_sub0;
     }
+
+    // Subsample outputs are complete in host storage; no later graph uses its arena.
+    if (const auto st = release_subsample_scratch(cc); st != TRANSCRIBE_OK) return st;
 
     // Build batched encoder graph.
     EncoderBuildBatched eb =
@@ -1411,11 +1902,11 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
 
     apply_sched_threads(cc);
 
-    const int64_t t_enc0 = ggml_time_us();
-    if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
+    const int64_t t_enc0 = INT64_C(0);
+    if (compute_qwen_graph(cc, eb.graph) != GGML_STATUS_SUCCESS) {
         return TRANSCRIBE_ERR_BACKEND;
     }
-    enc_us += ggml_time_us() - t_enc0;
+    enc_us += INT64_C(0) - t_enc0;
 
     // Readback [d_enc, T_pad_max, n]; slice each utterance's first T_enc[b] rows.
     const int          d_enc = static_cast<int>(eb.out->ne[0]);
@@ -1548,7 +2039,7 @@ transcribe_status prefill_all_batched(QwenAsrSession *                          
     }
 
     apply_sched_threads(cc);
-    if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
+    if (compute_qwen_graph(cc, pb.graph) != GGML_STATUS_SUCCESS) {
         return TRANSCRIBE_ERR_BACKEND;
     }
 
@@ -1690,13 +2181,13 @@ transcribe_status run_batch(transcribe_session *          session,
     std::vector<std::vector<float>> enc_hosts(n);
     std::vector<int>                T_enc(n, 0);
     const int     T_enc_cap  = ceiling - k_gen_reserve - prompt_tokens_without_system(0, lang_prefix_ptr);
-    const int64_t t_encpass0 = ggml_time_us();
+    const int64_t t_encpass0 = INT64_C(0);
     if (const transcribe_status st = encode_all_batched(cc, cm, pcm, n_samples, n, T_enc_cap, valid, fail_status,
                                                         enc_hosts, T_enc, mel_us, enc_us);
         st != TRANSCRIBE_OK) {
         return st;
     }
-    const int64_t enc_pass_us = ggml_time_us() - t_encpass0;
+    const int64_t enc_pass_us = INT64_C(0) - t_encpass0;
 
     // Prompt length bound → max_n_kv and batched-cache n_ctx. Build and keep
     // each utterance's prompt token ids for the batched prefill.
@@ -1771,7 +2262,7 @@ transcribe_status run_batch(transcribe_session *          session,
         ggml_backend_buffer_clear(cc->kv_cache_batch.buffer, 0);
     }
 
-    const int64_t t_prefpass0 = ggml_time_us();
+    const int64_t t_prefpass0 = INT64_C(0);
     {
         std::vector<int32_t> first_tok(n, 0);
         if (const transcribe_status st =
@@ -1788,7 +2279,7 @@ transcribe_status run_batch(transcribe_session *          session,
             generated[b].push_back(first_tok[b]);
         }
     }
-    const int64_t prefill_pass_us = ggml_time_us() - t_prefpass0;
+    const int64_t prefill_pass_us = INT64_C(0) - t_prefpass0;
 
     // Pass 2: batched step loop (shared causal_lm driver).
     const int32_t eos_id = cm->hparams.eos_token_id;
@@ -1821,6 +2312,7 @@ transcribe_status run_batch(transcribe_session *          session,
 
     transcribe::causal_lm::StepLoopStats step_stats;
     std::vector<char>                    truncated;
+    if (!check_qwen_graph_placement(cc, sb.graph)) return TRANSCRIBE_ERR_BACKEND;
     if (const transcribe_status st = transcribe::causal_lm::run_batched_step_loop(
             cc, cc->sched, io, n, max_n_kv, eos_id, max_new, step_state, generated, &step_stats, &truncated);
         st != TRANSCRIBE_OK) {
@@ -1863,6 +2355,507 @@ transcribe_status run_batch(transcribe_session *          session,
     return TRANSCRIBE_OK;
 }
 
+// ===========================================================================
+// Streaming: the conv stem runs while the audio arrives
+// ===========================================================================
+//
+// The conv stem (3x Conv2d + conv_out) works on independent n_window*2-frame
+// (1 s) mel chunks, so each chunk goes through it as soon as its audio has
+// arrived. Finalize then runs only the last chunk, the encoder transformer
+// and the decoder. The result is the offline one, bit for bit:
+//
+// * Mel frames. Frame t is the STFT of input samples [t*hop - n_fft/2,
+//   t*hop + n_fft/2) of the reflect-padded audio, so it is final once sample
+//   t*hop + n_fft/2 has arrived: the end-of-input reflection can no longer
+//   reach it. mel_log10 computes frames over a slice of the received audio
+//   that starts n_fft/2/hop + 1 hops before the first wanted frame, so the
+//   slice's own start padding never reaches a wanted frame, and each frame's
+//   STFT is computed from the same samples with the same code as offline.
+// * Normalization. per_utterance clamps every value to (max over the whole
+//   utterance) - 8 before scaling, so a chunk normalized with the running max
+//   can differ from offline once a louder frame arrives later. Each time a
+//   chunk completes, every earlier chunk is renormalized with the current max
+//   and the ones whose normalized mel changed (bitwise compare) are re-run
+//   with it; finalize does the same with the final max. So every chunk's conv
+//   input ends up exactly the offline one, and only a max that rises in the
+//   last partial chunk leaves re-runs for finalize.
+// * Conv stem. A chunk's output depends only on that chunk's mel (offline
+//   runs the chunks as an independent batch, and each output element is one
+//   dot product over that chunk's im2col), so it does not matter when or
+//   alongside which other chunks it was computed.
+//
+// The decoder sees the same encoder output, so the transcript is the
+// offline transcript; only the work after the end of the audio shrinks.
+
+transcribe_status ensure_sched(QwenAsrSession * cc, QwenAsrModel * cm) {
+    if (cc->sched == nullptr) {
+        cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
+                                           static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
+        if (cc->sched == nullptr) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr stream: ggml_backend_sched_new failed");
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+    }
+    return TRANSCRIBE_OK;
+}
+
+// Append raw log10 mel frames [stream_n_frames, t_end) computed from the first
+// n_avail received samples. Every frame in the range must be final for
+// n_avail samples, or n_avail must be the whole utterance.
+transcribe_status stream_add_frames(QwenAsrSession * cc, QwenAsrModel * cm, size_t n_avail, int t_end) {
+    const int t0 = cc->stream_n_frames;
+    if (t_end <= t0) {
+        return TRANSCRIBE_OK;
+    }
+    const transcribe::MelConfig & cfg    = cm->mel_log10->config();
+    const int                     hop    = cfg.hop_length;
+    const int                     n_mels = cfg.num_mels;
+    const int                     ctx    = (cfg.n_fft / 2) / hop + 1;
+    const int                     s0     = std::max(0, t0 - ctx);
+    const size_t                  off    = static_cast<size_t>(s0) * hop;
+
+    std::vector<float> raw;
+    int                nm = 0, nf = 0;
+    if (const transcribe_status st =
+            cm->mel_log10->compute(cc->stream_pcm.data() + off, n_avail - off, raw, nm, nf, cc->n_threads);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (nm != n_mels || t_end - s0 > nf) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    cc->stream_log_mel.resize(static_cast<size_t>(t_end) * n_mels);
+    for (int t = t0; t < t_end; ++t) {
+        float * dst = cc->stream_log_mel.data() + static_cast<size_t>(t) * n_mels;
+        for (int m = 0; m < n_mels; ++m) {
+            const float v = raw[static_cast<size_t>(m) * nf + (t - s0)];
+            dst[m]        = v;
+            if (v > cc->stream_max) {
+                cc->stream_max = v;
+            }
+        }
+    }
+    cc->stream_n_frames = t_end;
+    return TRANSCRIBE_OK;
+}
+
+// MelFrontend's per_utterance clamp and scaling for chunk c, with `maxv` as
+// the utterance max, into dst = [n_mels, mel_per_chunk] (pack_mel_chunks
+// layout; frames past the end of the audio stay zero).
+void stream_normalize_chunk(const QwenAsrSession * cc, int n_mels, int mel_per_chunk, int c, float maxv, float * dst) {
+    const double floor_val = static_cast<double>(maxv) - 8.0;
+    const int    f0        = c * mel_per_chunk;
+    const int    n_real    = std::min(mel_per_chunk, cc->stream_n_frames - f0);
+    for (int m = 0; m < n_mels; ++m) {
+        float * row = dst + static_cast<size_t>(m) * mel_per_chunk;
+        for (int t = 0; t < n_real; ++t) {
+            double v = static_cast<double>(cc->stream_log_mel[static_cast<size_t>(f0 + t) * n_mels + m]);
+            if (v < floor_val) {
+                v = floor_val;
+            }
+            row[t] = static_cast<float>((v + 4.0) / 4.0);
+        }
+        std::fill(row + std::max(0, n_real), row + mel_per_chunk, 0.0f);
+    }
+}
+
+// Bring the conv stem output up to date for chunks [0, n_chunks) at the
+// current max: chunks not run yet, and earlier chunks whose normalized mel
+// changed since they were run (the max rose). All of them go through one
+// subsample graph. Returns the number of chunks run in *n_run, of which
+// *n_rerun were re-runs.
+transcribe_status stream_run_chunks(QwenAsrSession * cc, QwenAsrModel * cm, int n_chunks, int * n_run, int * n_rerun) {
+    const int    n_mels        = cm->mel_log10->num_mels();
+    const int    mel_per_chunk = cm->hparams.enc_n_window * 2;
+    const size_t per_chunk     = static_cast<size_t>(mel_per_chunk) * n_mels;
+    const size_t out_chunk     = static_cast<size_t>(cm->hparams.enc_d_model) * aftercnn_len(mel_per_chunk);
+    const int    n_done        = cc->stream_n_chunks;
+
+    std::vector<int>   todo;
+    std::vector<float> packed;
+    std::vector<float> chunk(per_chunk);
+    *n_rerun = 0;
+    for (int c = 0; c < n_chunks; ++c) {
+        stream_normalize_chunk(cc, n_mels, mel_per_chunk, c, cc->stream_max, chunk.data());
+        if (c < n_done) {
+            float * prev = cc->stream_chunk_mel.data() + per_chunk * c;
+            if (std::memcmp(chunk.data(), prev, per_chunk * sizeof(float)) == 0) {
+                continue;
+            }
+            ++*n_rerun;
+        }
+        todo.push_back(c);
+        packed.insert(packed.end(), chunk.begin(), chunk.end());
+    }
+    *n_run = static_cast<int>(todo.size());
+    if (todo.empty()) {
+        return TRANSCRIBE_OK;
+    }
+    if (const transcribe_status st = ensure_sched(cc, cm); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (reset_compute_ctx(cc, 4, compute_metadata_bytes(cc, 4 * 1024 * 1024,
+                                                       static_cast<int>(todo.size()), false, 0)) != TRANSCRIBE_OK) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+    std::vector<float> out;
+    if (const transcribe_status st = run_subsample(cc, cm, packed.data(), static_cast<int>(todo.size()), out);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    cc->stream_chunk_mel.resize(per_chunk * std::max(n_chunks, n_done));
+    cc->stream_subsample.resize(out_chunk * std::max(n_chunks, n_done));
+    for (size_t i = 0; i < todo.size(); ++i) {
+        std::memcpy(cc->stream_chunk_mel.data() + per_chunk * todo[i], packed.data() + per_chunk * i,
+                    per_chunk * sizeof(float));
+        std::memcpy(cc->stream_subsample.data() + out_chunk * todo[i], out.data() + out_chunk * i,
+                    out_chunk * sizeof(float));
+    }
+    cc->stream_n_chunks = std::max(n_chunks, n_done);
+    return TRANSCRIBE_OK;
+}
+
+// Fill the prompt-prefix cache for a run with these params before its audio
+// is known: the chat frame and the system context, up to and including
+// <|audio_start|>, which is everything the prompt has before the audio. A
+// stream begins while the phrase is still being spoken, so this work is off
+// the path from the end of the audio to the text; finalize then prefills
+// only the audio and what follows it.
+//
+// The rows must be computed on the attention path of the final prompt
+// (tiled iff it has 64+ rows, decoder.h), which depends on the audio length.
+// T_enc_min is a lower bound on it (the audio so far): the prefix is
+// computed for the path that bound implies, and stream_feed calls this again
+// once the audio has grown enough to change it. The system context is fitted
+// as for a run with no audio; if the real run fits it differently, its
+// prompt simply shares less with the cache.
+transcribe_status prefill_prompt_prefix(QwenAsrSession * cc, QwenAsrModel * cm, const transcribe_run_params * params,
+                                        int T_enc_min) {
+    if (!prefix_cache_enabled()) {
+        return TRANSCRIBE_OK;
+    }
+    const int64_t        t0      = INT64_C(0);
+    const int            ceiling = qwen3_context_ceiling(cc->n_ctx, cm->hparams);
+    std::vector<int32_t> system_ids;
+    if (const transcribe_status st = encode_system_context(
+            cm->tok, params, ceiling - k_gen_reserve - prompt_tokens_without_system(0, nullptr), system_ids);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    std::vector<int32_t> lang_ids;
+    if (params->language != nullptr && params->language[0] != '\0') {
+        if (const transcribe_status st = encode_language_prefix(cm->tok, params->language, lang_ids);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+    }
+    std::vector<int32_t> ids;
+    std::vector<int64_t> audio_positions;
+    build_prompt_tokens(cm->hparams, cm->chat_tokens, /*T_enc=*/0, system_ids, &lang_ids, ids, audio_positions);
+    // <|im_start|>system\n + system + <|im_end|>\n<|im_start|>user\n<|audio_start|>
+    const int prefix_len = static_cast<int>(system_ids.size()) + 9;
+    if (prefix_len > static_cast<int>(ids.size()) || ids[prefix_len - 1] != cm->hparams.audio_start_token_id) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    const bool tiled        = static_cast<int>(ids.size()) + T_enc_min >= k_fa_tile_rows;
+    cc->stream_prompt_rows  = static_cast<int>(ids.size());
+    cc->stream_prefix_tiled = tiled ? 1 : 0;
+    const int n_past        = common_prefix(cc, ids.data(), prefix_len, tiled);
+    if (n_past == prefix_len) {
+        return TRANSCRIBE_OK;
+    }
+    if (cc->kv_cache.ctx == nullptr) {
+        int n_ctx = std::min(1024, ceiling);
+        if (khr_gpu_graph_policy(cc)) {
+            n_ctx = initial_khr_kv_capacity(prefix_len, ceiling);
+            log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
+                    "qwen3_asr KHR KV prefix: prompt=%zu audio_min=%d generation_budget=%d capacity=%d",
+                    ids.size(), T_enc_min, k_gen_reserve, n_ctx);
+        }
+        if (prefix_len > n_ctx) {
+            return TRANSCRIBE_OK;  // left to the run, which sizes the cache itself
+        }
+        const ggml_type kv_type = cc->kv_type == TRANSCRIBE_KV_TYPE_F32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+        if (!transcribe::causal_lm::kv_init(cc->kv_cache, cm->plan.primary, n_ctx, cm->hparams.dec_n_kv_heads,
+                                            cm->hparams.dec_head_dim, cm->hparams.dec_n_layers, kv_type)) {
+            return TRANSCRIBE_ERR_OOM;
+        }
+        clear_prefix_cache(cc);
+    } else if (prefix_len > cc->kv_cache.n_ctx) {
+        return TRANSCRIBE_OK;
+    }
+    if (const transcribe_status st = ensure_sched(cc, cm); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (reset_compute_ctx(cc, 16, compute_metadata_bytes(cc, 16 * 1024 * 1024, 0, false, 16384)) != TRANSCRIBE_OK) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+    const int         T_chunk = prefix_len - n_past;
+    PrefillChunkBuild pb      = build_prefill_chunk_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache,
+                                                          T_chunk, prefix_len, T_chunk, 0, 0, /*n_logits=*/0,
+                                                          cc->decoder_use_flash, chunk_fa_q_rows(T_chunk, tiled));
+    if (pb.graph == nullptr) {
+        return TRANSCRIBE_ERR_GGUF;
+    }
+    ggml_backend_sched_reset(cc->sched);
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, pb.graph, "qwen3_asr")) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+    apply_sched_threads(cc);
+    cc->kv_ids.resize(static_cast<size_t>(n_past));
+    cc->kv_tiled.resize(static_cast<size_t>(n_past));
+    ggml_backend_tensor_set(pb.input_ids_in, ids.data() + n_past, 0, static_cast<size_t>(T_chunk) * sizeof(int32_t));
+    {
+        std::vector<int32_t> positions(T_chunk);
+        std::vector<int64_t> kv_idx(T_chunk);
+        for (int i = 0; i < T_chunk; ++i) {
+            positions[i] = n_past + i;
+            kv_idx[i]    = n_past + i;
+        }
+        ggml_backend_tensor_set(pb.positions_in, positions.data(), 0, positions.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(pb.kv_idx_in, kv_idx.data(), 0, kv_idx.size() * sizeof(int64_t));
+    }
+    set_chunk_mask(pb, prefix_len, T_chunk, n_past);
+    if (compute_qwen_graph(cc, pb.graph) != GGML_STATUS_SUCCESS) {
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    cc->kv_cache.n = prefix_len;
+    cc->kv_cache.head = prefix_len;
+    cc->kv_ids.assign(ids.begin(), ids.begin() + prefix_len);
+    cc->kv_tiled.assign(static_cast<size_t>(prefix_len), tiled ? 1 : 0);
+    if (khr_gpu_graph_policy(cc) && transcribe::env::flag("TRANSCRIBE_RESOURCE_DIAGNOSTICS")) {
+        std::fprintf(stderr, "ASR_PREFIX_COMMIT rows=%d n=%d head=%d capacity=%d\n",
+                     prefix_len, cc->kv_cache.n, cc->kv_cache.head, cc->kv_cache.n_ctx);
+    }
+    const int64_t dt = INT64_C(0) - t0;
+    cc->begin_prefilled += T_chunk;
+    cc->t_begin_prefill_us += dt;
+    if (transcribe::env::flag("TRANSCRIBE_PERF_DEBUG")) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+                "qwen3_asr stream begin: prompt prefix %d tokens (%s), %d cached, %d prefilled in %.2f ms",
+                prefix_len, tiled ? "tiled" : "rows", n_past, T_chunk, dt / 1000.0);
+    }
+    return TRANSCRIBE_OK;
+}
+
+transcribe_status stream_validate(const transcribe_session * session,
+                                  const transcribe_run_params * /*run_params*/,
+                                  const transcribe_stream_params * stream_params) {
+    const auto * cm = static_cast<const QwenAsrModel *>(session->model);
+    if (cm == nullptr || !cm->mel_log10.has_value()) {
+        return TRANSCRIBE_ERR_NOT_IMPLEMENTED;
+    }
+    if (stream_params != nullptr && stream_params->family != nullptr) {
+        return TRANSCRIBE_ERR_INVALID_ARG;  // no family stream extension
+    }
+    return TRANSCRIBE_OK;
+}
+
+void stream_clear(QwenAsrSession * cc) {
+    cc->stream_pcm.clear();
+    cc->stream_log_mel.clear();
+    cc->stream_n_frames = 0;
+    cc->stream_max      = -std::numeric_limits<float>::infinity();
+    cc->stream_n_chunks = 0;
+    cc->stream_chunk_mel.clear();
+    cc->stream_subsample.clear();
+    cc->stream_feed_us    = 0;
+    cc->stream_conv_us    = 0;
+    cc->stream_recomputed = 0;
+    cc->stream_rerun_feed = 0;
+}
+
+transcribe_status stream_begin(transcribe_session *          session,
+                               const transcribe_run_params * run_params,
+                               const transcribe_stream_params * /*stream_params*/) {
+    auto * cc = static_cast<QwenAsrSession *>(session);
+    auto * cm = static_cast<QwenAsrModel *>(cc->model);
+    if (cm == nullptr || cm->plan.scheduler_list.empty() || !cm->mel_log10.has_value()) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    // Reject a bad language hint now rather than at finalize.
+    if (run_params->language != nullptr && run_params->language[0] != '\0') {
+        std::vector<int32_t> ids;
+        if (const transcribe_status st = encode_language_prefix(cm->tok, run_params->language, ids);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+    }
+    // The dispatcher owns the strings behind run_params for the stream's life.
+    cc->stream_run_params = *run_params;
+    stream_clear(cc);
+    transcribe::debug::init();
+    // The prompt before the audio is known now: prefill it while the audio
+    // arrives. A failure here only costs the cache.
+    cc->stream_prefix_tiled = -1;
+    cc->begin_prefilled     = 0;
+    cc->t_begin_prefill_us  = 0;
+    if (prefill_prompt_prefix(cc, cm, run_params, /*T_enc_min=*/0) != TRANSCRIBE_OK) {
+        clear_prefix_cache(cc);
+        cc->stream_prefix_tiled = -1;
+    }
+    return TRANSCRIBE_OK;
+}
+
+transcribe_status stream_feed(transcribe_session *       session,
+                              const float *              pcm,
+                              int                        n_samples,
+                              transcribe_stream_update * update) {
+    auto * cc = static_cast<QwenAsrSession *>(session);
+    auto * cm = static_cast<QwenAsrModel *>(cc->model);
+    if (cm == nullptr || cm->plan.scheduler_list.empty() || !cm->mel_log10.has_value()) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    if (cc->poll_abort()) {
+        return TRANSCRIBE_ERR_ABORTED;
+    }
+    const int64_t t_start = INT64_C(0);
+    cc->stream_pcm.insert(cc->stream_pcm.end(), pcm, pcm + n_samples);
+
+    const transcribe::MelConfig & cfg           = cm->mel_log10->config();
+    const int                     hop           = cfg.hop_length;
+    const int                     pad           = cfg.n_fft / 2;
+    const int                     mel_per_chunk = cm->hparams.enc_n_window * 2;
+    const size_t                  n_avail       = cc->stream_pcm.size();
+
+    // Frames t with t*hop + pad < n_avail are final (see above); computing
+    // them on every feed keeps the running max current. The conv stem runs
+    // when a chunk completes, together with any earlier chunk the max has
+    // changed since, so those re-runs also happen while the audio arrives.
+    const int n_final = (n_avail > static_cast<size_t>(pad)) ?
+                            static_cast<int>((n_avail - static_cast<size_t>(pad) - 1) / hop) + 1 :
+                            0;
+    if (const transcribe_status st = stream_add_frames(cc, cm, n_avail, n_final); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    const int n_ready = cc->stream_n_frames / mel_per_chunk;
+    if (n_ready > cc->stream_n_chunks) {
+        const int64_t t_conv0 = INT64_C(0);
+        int           n_run = 0, n_rerun = 0;
+        if (const transcribe_status st = stream_run_chunks(cc, cm, n_ready, &n_run, &n_rerun); st != TRANSCRIBE_OK) {
+            return st;
+        }
+        cc->stream_rerun_feed += n_rerun;
+        cc->stream_conv_us += INT64_C(0) - t_conv0;
+    }
+    // The audio so far may now be long enough that the final prompt takes the
+    // tiled attention path: recompute the cached prefix for it, still while
+    // the audio arrives.
+    if (cc->stream_prefix_tiled == 0 && cc->stream_n_frames > 0) {
+        const int T_enc_min = compute_encoder_timing(cc->stream_n_frames, cm->hparams).T_enc;
+        if (cc->stream_prompt_rows + T_enc_min >= k_fa_tile_rows &&
+            prefill_prompt_prefix(cc, cm, &cc->stream_run_params, T_enc_min) != TRANSCRIBE_OK) {
+            clear_prefix_cache(cc);
+            cc->stream_prefix_tiled = -1;
+        }
+    }
+    cc->stream_feed_us += INT64_C(0) - t_start;
+
+    if (update != nullptr) {
+        const int     sr      = std::max(1, cm->hparams.fe_sample_rate);
+        const int64_t done    = static_cast<int64_t>(cc->stream_n_chunks) * mel_per_chunk * hop;
+        update->revision          = cc->stream_revision;
+        update->input_received_ms = static_cast<int64_t>(n_avail) * 1000 / sr;
+        update->buffered_ms       = (static_cast<int64_t>(n_avail) - done) * 1000 / sr;
+    }
+    return TRANSCRIBE_OK;
+}
+
+transcribe_status stream_finalize(transcribe_session * session, transcribe_stream_update * update) {
+    auto * cc = static_cast<QwenAsrSession *>(session);
+    auto * cm = static_cast<QwenAsrModel *>(cc->model);
+    if (cm == nullptr || cm->plan.scheduler_list.empty() || !cm->mel_log10.has_value()) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    if (cc->poll_abort()) {
+        return TRANSCRIBE_ERR_ABORTED;
+    }
+    const float * pcm       = cc->stream_pcm.data();
+    const int     n_samples = static_cast<int>(cc->stream_pcm.size());
+
+    transcribe_status st = TRANSCRIBE_OK;
+    if (cc->stream_n_chunks == 0) {
+        // Less than one chunk arrived: nothing was precomputed.
+        st = run_impl(session, pcm, n_samples, &cc->stream_run_params, /*pre=*/nullptr);
+    } else {
+        const int    n_mels        = cm->mel_log10->num_mels();
+        const int    mel_per_chunk = cm->hparams.enc_n_window * 2;
+        const size_t per_chunk     = static_cast<size_t>(mel_per_chunk) * n_mels;
+
+        const int n_feed_chunks = cc->stream_n_chunks;
+        // The rest of the mel: per_utterance emits n_samples / hop frames.
+        const int64_t t_mel0 = INT64_C(0);
+        const int     n_out  = cm->mel->n_frames_for(static_cast<size_t>(n_samples)) - 1;
+        if (const transcribe_status mst = stream_add_frames(cc, cm, static_cast<size_t>(n_samples), n_out);
+            mst != TRANSCRIBE_OK) {
+            return mst;
+        }
+        cc->t_mel_us = INT64_C(0) - t_mel0;
+
+        // Conv stem for the chunks that were not run yet, and for any early
+        // chunk whose normalized mel changed because the max rose after it.
+        const int64_t   t_conv0 = INT64_C(0);
+        PrecomputedStem pre{};
+        pre.timing        = compute_encoder_timing(n_out, cm->hparams);
+        const int n_chunk = pre.timing.n_chunks;
+        int       n_run = 0, n_rerun = 0;
+        if (const transcribe_status sst = stream_run_chunks(cc, cm, n_chunk, &n_run, &n_rerun); sst != TRANSCRIBE_OK) {
+            return sst;
+        }
+        cc->stream_recomputed = n_rerun;
+        pre.subsample      = cc->stream_subsample;
+        pre.t_subsample_us = INT64_C(0) - t_conv0;
+
+        // The assembled mel, for the debug dump only.
+        cc->mel_buf.clear();
+        if (transcribe::debug::enabled()) {
+            std::vector<float> chunk(per_chunk);
+            cc->mel_buf.assign(static_cast<size_t>(n_mels) * n_out, 0.0f);
+            for (int c = 0; c < n_chunk; ++c) {
+                stream_normalize_chunk(cc, n_mels, mel_per_chunk, c, cc->stream_max, chunk.data());
+                const int n_real = std::min(mel_per_chunk, n_out - c * mel_per_chunk);
+                for (int m = 0; m < n_mels; ++m) {
+                    std::memcpy(cc->mel_buf.data() + static_cast<size_t>(m) * n_out + c * mel_per_chunk,
+                                chunk.data() + static_cast<size_t>(m) * mel_per_chunk, n_real * sizeof(float));
+                }
+            }
+        }
+
+        if (transcribe::env::flag("TRANSCRIBE_PERF_DEBUG")) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+                    "qwen3_asr stream: %d of %d chunks through the conv stem during feed (%d re-runs; "
+                    "feed %.2f ms, conv stem %.2f ms); at finalize: %d chunks (%d re-run after the max "
+                    "rose), mel %.2f ms, conv stem %.2f ms",
+                    n_feed_chunks, n_chunk, cc->stream_rerun_feed, cc->stream_feed_us / 1000.0,
+                    cc->stream_conv_us / 1000.0, n_run, n_rerun, cc->t_mel_us / 1000.0,
+                    pre.t_subsample_us / 1000.0);
+        }
+        st = run_impl(session, pcm, n_samples, &cc->stream_run_params, &pre);
+    }
+
+    // A stream reports truncation through transcribe_was_truncated() only.
+    if (st == TRANSCRIBE_ERR_OUTPUT_TRUNCATED || st == TRANSCRIBE_ERR_OUTPUT_REPETITION) {
+        st = TRANSCRIBE_OK;
+    }
+    if (st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (update != nullptr) {
+        const int     sr       = std::max(1, cm->hparams.fe_sample_rate);
+        const int64_t audio_ms = static_cast<int64_t>(n_samples) * 1000 / sr;
+        update->result_changed     = true;
+        update->revision           = cc->stream_revision;
+        update->input_received_ms  = audio_ms;
+        update->audio_committed_ms = audio_ms;
+        update->buffered_ms        = 0;
+    }
+    return TRANSCRIBE_OK;
+}
+
+void stream_reset(transcribe_session * session) {
+    stream_clear(static_cast<QwenAsrSession *>(session));
+}
+
 }  // namespace
 
 extern const Arch arch = {
@@ -1871,12 +2864,57 @@ extern const Arch arch = {
     /* .init_context     = */ init_context,
     /* .run              = */ run,
     /* .run_batch        = */ run_batch,
-    /* .stream_validate  = */ nullptr,
-    /* .stream_begin     = */ nullptr,
-    /* .stream_feed      = */ nullptr,
-    /* .stream_finalize  = */ nullptr,
-    /* .stream_reset     = */ nullptr,
+    /* .stream_validate  = */ stream_validate,
+    /* .stream_begin     = */ stream_begin,
+    /* .stream_feed      = */ stream_feed,
+    /* .stream_finalize  = */ stream_finalize,
+    /* .stream_reset     = */ stream_reset,
     /* .accepts_ext_kind = */ nullptr,
 };
+
+
+extern "C" transcribe_status transcribe_qwen3_asr_warmup(
+    transcribe_model * model, const transcribe_session_params * session_params,
+    const float * pcm, int n_samples, const transcribe_run_params * params, bool streaming) {
+    if (!model || model->arch != &arch || !khr_gpu_model_policy(static_cast<QwenAsrModel *>(model)) ||
+        active_warmup || !pcm || n_samples <= 0) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    transcribe_session * temporary = nullptr;
+    transcribe_status status = transcribe_session_init(model, session_params, &temporary);
+    if (status != TRANSCRIBE_OK) return status;
+    WarmupState state{temporary, streaming};
+    {
+        struct Scope {
+            WarmupState * previous;
+            transcribe_session * session;
+            ~Scope() {
+                if (session->sched) ggml_backend_sched_synchronize(session->sched);
+                const char *mode = active_warmup->streaming ? "streaming" : "offline";
+                asr_resource_snapshot("warm_cleanup_before", mode);
+                active_warmup = previous;
+                transcribe_session_free(session);
+                asr_resource_snapshot("warm_cleanup_after", mode);
+                asr_release_unused_heap("warm_cleanup", mode,
+                    transcribe::env::flag("TRANSCRIBE_RESOURCE_DIAGNOSTICS"));
+            }
+        } scope{active_warmup, temporary};
+        active_warmup = &state;
+        if (streaming) {
+            status = transcribe_stream_begin(temporary, params, nullptr);
+            if (status == TRANSCRIBE_OK) status = transcribe_stream_feed(temporary, pcm, n_samples, nullptr);
+            if (status == TRANSCRIBE_OK) status = transcribe_stream_finalize(temporary, nullptr);
+        } else {
+            status = transcribe_run(temporary, pcm, n_samples, params);
+        }
+        if (status == TRANSCRIBE_OK && state.completed_steps != 1) status = TRANSCRIBE_ERR_BACKEND;
+    }
+    if (transcribe::env::flag("TRANSCRIBE_RESOURCE_DIAGNOSTICS")) {
+        std::fprintf(stderr,
+                     "ASR_WARMUP_DONE mode=%s steps=%d temporary_session=1 synchronized=1 status=%d\n",
+                     streaming ? "streaming" : "offline", state.completed_steps, static_cast<int>(status));
+    }
+    return status;
+}
 
 }  // namespace transcribe::qwen3_asr

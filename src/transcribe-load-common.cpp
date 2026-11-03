@@ -729,7 +729,9 @@ transcribe_status stream_tensor_data(const std::string &   path,
     // Vulkan grows a per-device staging buffer, kept for the life of the
     // process, to the largest single write (243 MiB for Qwen3-ASR-1.7B's token
     // embedding), on top of ours.
-    constexpr size_t k_stage_chunk = size_t(16) << 20;
+    const char * khr_profile = std::getenv("TRANSCRIBE_VULKAN_KHR_PROFILE");
+    const size_t k_stage_chunk = khr_profile && !std::strcmp(khr_profile, "1") ?
+                                    size_t(1) << 20 : size_t(16) << 20;
 
     const size_t         data_offset = gguf_get_data_offset(gguf_data);
     std::vector<uint8_t> staging;

@@ -108,6 +108,28 @@ ggml_tensor * linear(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_
     return y;
 }
 
+// 3x3 conv, stride 2, pad 1, for a weight stored either as the usual 4D
+// [KW, KH, IC, OC] kernel (ggml_conv_2d) or as a quantized 2D matrix
+// [KW*KH*IC, OC]. ggml_conv_2d multiplies with the kernel as src1, which must
+// be F32/F16, and builds its im2col in F16, which this class of CPU (no FP16
+// arithmetic) runs slowly. For a 2D weight, build the im2col in F32 and
+// multiply with the weight as src0 so the quantized dot product is used,
+// then restore ggml_conv_2d's output layout [OW, OH, OC, N].
+static ggml_tensor * conv3x3_s2(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x) {
+    if (ggml_n_dims(w) != 2) {
+        return ggml_conv_2d(ctx, w, x, 2, 2, 1, 1, 1, 1);
+    }
+    const int64_t ic = x->ne[2];
+    const int64_t oc = w->ne[1];
+    // im2col reads only the kernel's shape; this stands in for it.
+    ggml_tensor * shape = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, ic, 1);
+    ggml_tensor * cols  = ggml_im2col(ctx, shape, x, 2, 2, 1, 1, 1, 1, true, GGML_TYPE_F32); // [N, OH, OW, IC*9]
+    ggml_tensor * y     = ggml_mul_mat(ctx, w, ggml_reshape_2d(ctx, cols, cols->ne[0], cols->ne[1] * cols->ne[2] * cols->ne[3]));
+    y = ggml_cont(ctx, ggml_transpose(ctx, y)); // [OC, N*OH*OW] -> [N*OH*OW, OC]
+    y = ggml_reshape_4d(ctx, y, cols->ne[1], cols->ne[2], cols->ne[3], oc);
+    return ggml_cont(ctx, ggml_permute(ctx, y, 0, 1, 3, 2));
+}
+
 // Conv subsample + conv_out (no PE) for `mel` with ne=[mel_per_chunk,
 // n_mels, 1, n] (any n). Returns [d_model, T_per_chunk, n], or nullptr if the
 // conv output width does not match T_per_chunk.
@@ -128,10 +150,10 @@ ggml_tensor * subsample_group(ggml_context *         ctx,
                                    /*s0=*/2, /*s1=*/2, /*p0=*/1, /*p1=*/1, /*d0=*/1, /*d1=*/1);
     x               = add_conv_bias(ctx, x, weights.enc_subsample.conv0_b);
     x               = ggml_gelu_erf(ctx, x);
-    x               = ggml_conv_2d(ctx, weights.enc_subsample.conv1_w, x, 2, 2, 1, 1, 1, 1);
+    x               = conv3x3_s2(ctx, weights.enc_subsample.conv1_w, x);
     x               = add_conv_bias(ctx, x, weights.enc_subsample.conv1_b);
     x               = ggml_gelu_erf(ctx, x);
-    x               = ggml_conv_2d(ctx, weights.enc_subsample.conv2_w, x, 2, 2, 1, 1, 1, 1);
+    x               = conv3x3_s2(ctx, weights.enc_subsample.conv2_w, x);
     x               = add_conv_bias(ctx, x, weights.enc_subsample.conv2_b);
     x               = ggml_gelu_erf(ctx, x);
     // Now ne = [W=mel_ds, H=n_mels_ds, C=ds_h, N=n].
