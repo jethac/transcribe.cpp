@@ -93,7 +93,7 @@ transcribe_status init_storage(Model &                              m,
 }
 
 transcribe_status load(Loader & loader, const transcribe_model_load_params * params, transcribe_model ** out_model) {
-    const int64_t t_load_start = INT64_C(0);
+    const int64_t t_load_start = ggml_time_us();
 
     auto m     = std::make_unique<Model>();
     m->arch    = &arch;
@@ -133,7 +133,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
 
     m->roles = TRANSCRIBE_ROLE_VAD;
     set_feature(m.get(), TRANSCRIBE_FEATURE_CANCELLATION, true);
-    m->t_load_us = INT64_C(0) - t_load_start;
+    m->t_load_us = ggml_time_us() - t_load_start;
     *out_model   = m.release();
     return TRANSCRIBE_OK;
 }
@@ -206,17 +206,17 @@ transcribe_status vad_score(transcribe_vad_session * session, const float * pcm,
 
         const int     n_graph = std::max(n, k_min_graph_frames);
         const size_t  per_win = static_cast<size_t>(hp.t_len[0]) * static_cast<size_t>(hp.n_fft);
-        const int64_t t0      = INT64_C(0);
+        const int64_t t0      = ggml_time_us();
         s.windows.assign(static_cast<size_t>(n_graph) * per_win, 0.0f);
         s.gates_in.resize(static_cast<size_t>(n_graph) * 4 * static_cast<size_t>(hp.hidden));
         build_windows(s, hp, pcm + f0 * hp.frame_samples, n, s.windows.data());
         if (auto st = encode_block(s, m, s.windows.data(), n_graph, n, s.gates_in.data()); st != TRANSCRIBE_OK) {
             return st;
         }
-        const int64_t t1 = INT64_C(0);
+        const int64_t t1 = ggml_time_us();
         decode_block(s, m, s.gates_in.data(), n, probs + f0);
         s.t_encode_us += t1 - t0;
-        s.t_decode_us += INT64_C(0) - t1;
+        s.t_decode_us += ggml_time_us() - t1;
         s.trace.n_frames += debug::enabled() ? n : 0;
     }
     return TRANSCRIBE_OK;
@@ -301,7 +301,7 @@ transcribe_status load_from_bin(const char *                         path,
                                 const transcribe_model_load_params * params,
                                 transcribe_model **                  out_model) {
     *out_model                 = nullptr;
-    const int64_t t_load_start = INT64_C(0);
+    const int64_t t_load_start = ggml_time_us();
     BinReader     r(path);
     auto          bad = []() {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: invalid or unsupported Silero .bin", kTag);
@@ -466,7 +466,7 @@ transcribe_status load_from_bin(const char *                         path,
     }
     m->roles = TRANSCRIBE_ROLE_VAD;
     set_feature(m.get(), TRANSCRIBE_FEATURE_CANCELLATION, true);
-    m->t_load_us = INT64_C(0) - t_load_start;
+    m->t_load_us = ggml_time_us() - t_load_start;
     *out_model   = m.release();
     return TRANSCRIBE_OK;
 }

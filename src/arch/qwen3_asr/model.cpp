@@ -269,7 +269,7 @@ int64_t qwen3_max_audio_ms(const QwenAsrHParams & hp) {
 transcribe_status resolve_chat_tokens(const transcribe::Tokenizer & tok, ChatTokens & out);
 
 transcribe_status load(Loader & loader, const transcribe_model_load_params * params, transcribe_model ** out_model) {
-    const int64_t t_load_start = INT64_C(0);
+    const int64_t t_load_start = ggml_time_us();
 
     auto m       = std::make_unique<QwenAsrModel>();
     m->arch      = &arch;
@@ -443,7 +443,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         }
     }
 
-    m->t_load_us = INT64_C(0) - t_load_start;
+    m->t_load_us = ggml_time_us() - t_load_start;
     *out_model   = m.release();
     return TRANSCRIBE_OK;
 }
@@ -918,7 +918,7 @@ transcribe_status run_impl(transcribe_session *          session,
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: model has no MelFrontend");
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
-    const int64_t t_mel_start  = INT64_C(0);
+    const int64_t t_mel_start  = ggml_time_us();
     int           mel_n_mels   = cm->mel->num_mels();
     int           mel_n_frames = (pre != nullptr) ? pre->timing.n_mel_frames : 0;
     if (pre == nullptr) {
@@ -929,7 +929,7 @@ transcribe_status run_impl(transcribe_session *          session,
                     transcribe_status_string(mst));
             return mst;
         }
-        cc->t_mel_us = INT64_C(0) - t_mel_start;
+        cc->t_mel_us = ggml_time_us() - t_mel_start;
     }
 
     // Dump the post-frontend mel in the reference's contract shape
@@ -974,7 +974,7 @@ transcribe_status run_impl(transcribe_session *          session,
     // per-run cost (graph build, sched alloc, uploads, prefill compute)
     // that the public transcribe_timings (mel/encode/decode) doesn't
     // expose, for the TRANSCRIBE_PERF_DEBUG breakdown.
-    const int64_t t_enc_build_start    = INT64_C(0);
+    const int64_t t_enc_build_start    = ggml_time_us();
     int64_t       t_enc_build_us       = 0;
     int64_t       t_enc_d2h_us         = 0;
     int64_t       t_prefill_build_us   = 0;
@@ -1019,12 +1019,12 @@ transcribe_status run_impl(transcribe_session *          session,
     } else {
         std::vector<float> mel_batched;
         pack_mel_chunks(cc->mel_buf.data(), mel_n_mels, mel_n_frames, timing, mel_batched);
-        const int64_t t_sub0 = INT64_C(0);
+        const int64_t t_sub0 = ggml_time_us();
         if (const transcribe_status st = run_subsample(cc, cm, mel_batched.data(), timing.n_chunks, subsample_host);
             st != TRANSCRIBE_OK) {
             return st;
         }
-        t_subsample_us = INT64_C(0) - t_sub0;
+        t_subsample_us = ggml_time_us() - t_sub0;
     }
 
     // Subsample outputs are complete in host storage; no later graph uses its arena.
@@ -1076,13 +1076,13 @@ transcribe_status run_impl(transcribe_session *          session,
 
     transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
 
-    const int64_t t_enc_start = INT64_C(0);
+    const int64_t t_enc_start = ggml_time_us();
     t_enc_build_us            = t_enc_start - t_enc_build_start - t_subsample_us;
     if (const ggml_status gs = compute_qwen_graph(cc, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: encoder graph compute failed (%d)", static_cast<int>(gs));
         return TRANSCRIBE_ERR_BACKEND;
     }
-    cc->t_encode_us = INT64_C(0) - t_enc_start + t_subsample_us;
+    cc->t_encode_us = ggml_time_us() - t_enc_start + t_subsample_us;
 
     // Dump encoder intermediates.
     auto try_dump = [](const char * name, ggml_tensor * t, const char * stage) {
@@ -1111,14 +1111,14 @@ transcribe_status run_impl(transcribe_session *          session,
         std::vector<float>().swap(cc->enc_host);
     } else {
         cc->enc_host.resize(static_cast<size_t>(d_enc) * static_cast<size_t>(T_enc));
-        const int64_t t_d2h_start = INT64_C(0);
+        const int64_t t_d2h_start = ggml_time_us();
         ggml_backend_tensor_get(eb.out, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
-        t_enc_d2h_us = INT64_C(0) - t_d2h_start;
+        t_enc_d2h_us = ggml_time_us() - t_d2h_start;
     }
 
     // Decode phase begins. t_dec_start covers prompt + KV init + prefill
     // build/compute + step loop (prefill is part of "decode" to users).
-    const int64_t t_dec_start           = INT64_C(0);
+    const int64_t t_dec_start           = ggml_time_us();
     const int64_t t_prefill_build_start = t_dec_start;
 
     // Prompt construction.
@@ -1309,13 +1309,13 @@ transcribe_status run_impl(transcribe_session *          session,
             ggml_backend_tensor_set(pb.mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
 
-        const int64_t t_prefill_compute_start = INT64_C(0);
+        const int64_t t_prefill_compute_start = ggml_time_us();
         t_prefill_build_us                    = t_prefill_compute_start - t_prefill_build_start;
         if (const ggml_status gs = compute_qwen_graph(cc, pb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: prefill graph compute failed (%d)", static_cast<int>(gs));
             return TRANSCRIBE_ERR_BACKEND;
         }
-        t_prefill_compute_us = INT64_C(0) - t_prefill_compute_start;
+        t_prefill_compute_us = ggml_time_us() - t_prefill_compute_start;
 
         cc->kv_cache.n    = T_prompt;
         cc->kv_cache.head = T_prompt;
@@ -1333,7 +1333,7 @@ transcribe_status run_impl(transcribe_session *          session,
         try_dump("dec.logits_raw", pb.dumps.logits_raw, "dec.logits_raw");
 
         // Read prefill logits + first argmax.
-        const int64_t      t_prefill_logits_start = INT64_C(0);
+        const int64_t      t_prefill_logits_start = ggml_time_us();
         std::vector<float> logits(vocab);
         ggml_backend_tensor_get(pb.out, logits.data(), 0, logits.size() * sizeof(float));
 
@@ -1341,7 +1341,7 @@ transcribe_status run_impl(transcribe_session *          session,
         next_tok = argmax(logits.data(), vocab);
         logit0_max = logits[next_tok];
         generated_ids.push_back(next_tok);
-        t_prefill_logits_us = INT64_C(0) - t_prefill_logits_start;
+        t_prefill_logits_us = ggml_time_us() - t_prefill_logits_start;
     } else {
         // Prefill [n_past, T_prompt + n_draft) on top of the cached rows.
         // (Debug dumps of decoder intermediates are on the path above only.)
@@ -1389,18 +1389,18 @@ transcribe_status run_impl(transcribe_session *          session,
         }
         set_chunk_mask(pb, T_full, T_chunk, n_past);
 
-        const int64_t t_prefill_compute_start = INT64_C(0);
+        const int64_t t_prefill_compute_start = ggml_time_us();
         t_prefill_build_us                    = t_prefill_compute_start - t_prefill_build_start;
         if (const ggml_status gs = compute_qwen_graph(cc, pb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: prefill graph compute failed (%d)",
                     static_cast<int>(gs));
             return TRANSCRIBE_ERR_BACKEND;
         }
-        t_prefill_compute_us = INT64_C(0) - t_prefill_compute_start;
+        t_prefill_compute_us = ggml_time_us() - t_prefill_compute_start;
 
         // Logits row j predicts position T_prompt + j: keep the draft while
         // the model agrees with it, then its own token.
-        const int64_t      t_prefill_logits_start = INT64_C(0);
+        const int64_t      t_prefill_logits_start = ggml_time_us();
         std::vector<float> logits(static_cast<size_t>(vocab) * n_logits);
         ggml_backend_tensor_get(pb.out, logits.data(), 0, logits.size() * sizeof(float));
         logit0_max = logits[argmax(logits.data(), vocab)];
@@ -1411,7 +1411,7 @@ transcribe_status run_impl(transcribe_session *          session,
         }
         next_tok = argmax(logits.data() + static_cast<size_t>(vocab) * n_accepted, vocab);
         generated_ids.push_back(next_tok);
-        t_prefill_logits_us = INT64_C(0) - t_prefill_logits_start;
+        t_prefill_logits_us = ggml_time_us() - t_prefill_logits_start;
 
         cc->kv_cache.n    = T_prompt + n_accepted;
         cc->kv_cache.head = T_prompt + n_accepted;
@@ -1441,7 +1441,7 @@ transcribe_status run_impl(transcribe_session *          session,
     }
     if (khr_gpu_graph_policy(cc)) max_n_kv = std::min(cc->kv_cache.n_ctx, kv_capacity_limit);
     const int step_capacity_limit = khr_gpu_graph_policy(cc) ? kv_capacity_limit : max_n_kv;
-    const int64_t t_step_build_start = INT64_C(0);
+    const int64_t t_step_build_start = ggml_time_us();
     const ggml_fp16_t mask_zero = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t mask_neg_inf = ggml_fp32_to_fp16(-INFINITY);
     StepBuild sb{};
@@ -1469,13 +1469,13 @@ transcribe_status run_impl(transcribe_session *          session,
         return TRANSCRIBE_OK;
     };
     if (const auto st = rebuild_step_graph(); st != TRANSCRIBE_OK) return st;
-    const int64_t t_step_build_once_us = INT64_C(0) - t_step_build_start;
+    const int64_t t_step_build_once_us = ggml_time_us() - t_step_build_start;
 
     // Per-step timers.
     int64_t       t_step_set_us     = 0;
     int64_t       t_step_comp_us    = 0;
     int64_t       t_step_get_us     = 0;
-    const int64_t t_step_loop_start = INT64_C(0);
+    const int64_t t_step_loop_start = ggml_time_us();
     bool          repeating         = false;
     const bool warming = active_warmup && active_warmup->session == session;
     while ((next_tok != eos_id || warming) && static_cast<int32_t>(generated_ids.size()) < max_new &&
@@ -1493,7 +1493,7 @@ transcribe_status run_impl(transcribe_session *          session,
             max_n_kv = cc->kv_cache.n_ctx;
             if (const auto st = rebuild_step_graph(); st != TRANSCRIBE_OK) return st;
         }
-        const int64_t t_set0 = INT64_C(0);
+        const int64_t t_set0 = ggml_time_us();
 
         ggml_backend_tensor_set(sb.input_id_in, &next_tok, 0, sizeof(int32_t));
         const int32_t pos_val = cur_past;
@@ -1512,14 +1512,14 @@ transcribe_status run_impl(transcribe_session *          session,
         }
         ggml_backend_tensor_set(sb.mask_in, step_mask.data(), 0, static_cast<size_t>(max_n_kv) * sizeof(ggml_fp16_t));
 
-        const int64_t t_set1 = INT64_C(0);
+        const int64_t t_set1 = ggml_time_us();
         t_step_set_us += t_set1 - t_set0;
 
         if (const ggml_status gs = compute_qwen_graph(cc, sb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr step: graph compute failed (%d)", static_cast<int>(gs));
             return TRANSCRIBE_ERR_BACKEND;
         }
-        const int64_t t_comp1 = INT64_C(0);
+        const int64_t t_comp1 = ggml_time_us();
         t_step_comp_us += t_comp1 - t_set1;
 
         int32_t argmax_tok = 0;
@@ -1529,7 +1529,7 @@ transcribe_status run_impl(transcribe_session *          session,
         cur_past += 1;
         cc->kv_cache.n    = cur_past + 1;
         cc->kv_cache.head = cur_past + 1;
-        t_step_get_us += INT64_C(0) - t_comp1;
+        t_step_get_us += ggml_time_us() - t_comp1;
         if (warming) {
             ++active_warmup->completed_steps;
             if (transcribe::env::flag("TRANSCRIBE_RESOURCE_DIAGNOSTICS")) {
@@ -1547,7 +1547,7 @@ transcribe_status run_impl(transcribe_session *          session,
     if (warming) {
         return active_warmup->completed_steps == 1 ? TRANSCRIBE_OK : TRANSCRIBE_ERR_BACKEND;
     }
-    t_step_loop_us = INT64_C(0) - t_step_loop_start;
+    t_step_loop_us = ggml_time_us() - t_step_loop_start;
     n_steps        = static_cast<int>(generated_ids.size()) - 1 - n_accepted;
 
     // The header this run generated, as the next run's draft.
@@ -1625,7 +1625,7 @@ transcribe_status run_impl(transcribe_session *          session,
     }
 
     // Write full_text + a single segment (no timestamps; TIMESTAMPS_NONE).
-    cc->t_decode_us = INT64_C(0) - t_dec_start;
+    cc->t_decode_us = ggml_time_us() - t_dec_start;
 
     // Optional perf breakdown (finer split than the public mel/encode/decode
     // timings), gated on env var.
@@ -1635,7 +1635,7 @@ transcribe_status run_impl(transcribe_session *          session,
                 "prefill_ms=%.2f steps=%d step_ms=%.2f decode_ms=%.2f l0=%a",
                 T_prompt, T_enc, prefix_len, cc->kv_reused, cc->kv_prefilled + n_draft, cc->draft_ok, n_draft,
                 cc->t_prefill_us / 1000.0, n_steps, t_step_loop_us / 1000.0,
-                (INT64_C(0) - t_dec_start) / 1000.0, static_cast<double>(logit0_max));
+                (ggml_time_us() - t_dec_start) / 1000.0, static_cast<double>(logit0_max));
         const double ms     = 1.0 / 1000.0;
         const double sum_ms = (cc->t_mel_us + t_enc_build_us + cc->t_encode_us + t_enc_d2h_us + t_prefill_build_us +
                                t_prefill_compute_us + t_prefill_logits_us + t_step_loop_us) *
@@ -1752,7 +1752,7 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
     if (n_threads <= 0) {
         n_threads = transcribe::default_n_threads();
     }
-    const int64_t t_mel0 = INT64_C(0);
+    const int64_t t_mel0 = ggml_time_us();
     transcribe::parallel_for_all(n, n_threads, [&](int b) {
         if (pcm[b] == nullptr || n_samples[b] <= 0) {
             return true;  // valid stays 0
@@ -1766,7 +1766,7 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
         valid[b]  = 1;
         return true;
     });
-    mel_us += INT64_C(0) - t_mel0;
+    mel_us += ggml_time_us() - t_mel0;
 
     // Per-utterance timing + packing geometry.
     std::vector<EncoderTiming> timings(n);
@@ -1836,12 +1836,12 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
                 }
             }
         }
-        const int64_t t_sub0 = INT64_C(0);
+        const int64_t t_sub0 = ggml_time_us();
         if (const transcribe_status st = run_subsample(cc, cm, packed.data(), n * n_chunks_max, subsample_host);
             st != TRANSCRIBE_OK) {
             return st;
         }
-        enc_us += INT64_C(0) - t_sub0;
+        enc_us += ggml_time_us() - t_sub0;
     }
 
     // Subsample outputs are complete in host storage; no later graph uses its arena.
@@ -1902,11 +1902,11 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
 
     apply_sched_threads(cc);
 
-    const int64_t t_enc0 = INT64_C(0);
+    const int64_t t_enc0 = ggml_time_us();
     if (compute_qwen_graph(cc, eb.graph) != GGML_STATUS_SUCCESS) {
         return TRANSCRIBE_ERR_BACKEND;
     }
-    enc_us += INT64_C(0) - t_enc0;
+    enc_us += ggml_time_us() - t_enc0;
 
     // Readback [d_enc, T_pad_max, n]; slice each utterance's first T_enc[b] rows.
     const int          d_enc = static_cast<int>(eb.out->ne[0]);
@@ -2181,13 +2181,13 @@ transcribe_status run_batch(transcribe_session *          session,
     std::vector<std::vector<float>> enc_hosts(n);
     std::vector<int>                T_enc(n, 0);
     const int     T_enc_cap  = ceiling - k_gen_reserve - prompt_tokens_without_system(0, lang_prefix_ptr);
-    const int64_t t_encpass0 = INT64_C(0);
+    const int64_t t_encpass0 = ggml_time_us();
     if (const transcribe_status st = encode_all_batched(cc, cm, pcm, n_samples, n, T_enc_cap, valid, fail_status,
                                                         enc_hosts, T_enc, mel_us, enc_us);
         st != TRANSCRIBE_OK) {
         return st;
     }
-    const int64_t enc_pass_us = INT64_C(0) - t_encpass0;
+    const int64_t enc_pass_us = ggml_time_us() - t_encpass0;
 
     // Prompt length bound → max_n_kv and batched-cache n_ctx. Build and keep
     // each utterance's prompt token ids for the batched prefill.
@@ -2262,7 +2262,7 @@ transcribe_status run_batch(transcribe_session *          session,
         ggml_backend_buffer_clear(cc->kv_cache_batch.buffer, 0);
     }
 
-    const int64_t t_prefpass0 = INT64_C(0);
+    const int64_t t_prefpass0 = ggml_time_us();
     {
         std::vector<int32_t> first_tok(n, 0);
         if (const transcribe_status st =
@@ -2279,7 +2279,7 @@ transcribe_status run_batch(transcribe_session *          session,
             generated[b].push_back(first_tok[b]);
         }
     }
-    const int64_t prefill_pass_us = INT64_C(0) - t_prefpass0;
+    const int64_t prefill_pass_us = ggml_time_us() - t_prefpass0;
 
     // Pass 2: batched step loop (shared causal_lm driver).
     const int32_t eos_id = cm->hparams.eos_token_id;
@@ -2534,7 +2534,7 @@ transcribe_status prefill_prompt_prefix(QwenAsrSession * cc, QwenAsrModel * cm, 
     if (!prefix_cache_enabled()) {
         return TRANSCRIBE_OK;
     }
-    const int64_t        t0      = INT64_C(0);
+    const int64_t        t0      = ggml_time_us();
     const int            ceiling = qwen3_context_ceiling(cc->n_ctx, cm->hparams);
     std::vector<int32_t> system_ids;
     if (const transcribe_status st = encode_system_context(
@@ -2627,7 +2627,7 @@ transcribe_status prefill_prompt_prefix(QwenAsrSession * cc, QwenAsrModel * cm, 
         std::fprintf(stderr, "ASR_PREFIX_COMMIT rows=%d n=%d head=%d capacity=%d\n",
                      prefix_len, cc->kv_cache.n, cc->kv_cache.head, cc->kv_cache.n_ctx);
     }
-    const int64_t dt = INT64_C(0) - t0;
+    const int64_t dt = ggml_time_us() - t0;
     cc->begin_prefilled += T_chunk;
     cc->t_begin_prefill_us += dt;
     if (transcribe::env::flag("TRANSCRIBE_PERF_DEBUG")) {
@@ -2709,7 +2709,7 @@ transcribe_status stream_feed(transcribe_session *       session,
     if (cc->poll_abort()) {
         return TRANSCRIBE_ERR_ABORTED;
     }
-    const int64_t t_start = INT64_C(0);
+    const int64_t t_start = ggml_time_us();
     cc->stream_pcm.insert(cc->stream_pcm.end(), pcm, pcm + n_samples);
 
     const transcribe::MelConfig & cfg           = cm->mel_log10->config();
@@ -2730,13 +2730,13 @@ transcribe_status stream_feed(transcribe_session *       session,
     }
     const int n_ready = cc->stream_n_frames / mel_per_chunk;
     if (n_ready > cc->stream_n_chunks) {
-        const int64_t t_conv0 = INT64_C(0);
+        const int64_t t_conv0 = ggml_time_us();
         int           n_run = 0, n_rerun = 0;
         if (const transcribe_status st = stream_run_chunks(cc, cm, n_ready, &n_run, &n_rerun); st != TRANSCRIBE_OK) {
             return st;
         }
         cc->stream_rerun_feed += n_rerun;
-        cc->stream_conv_us += INT64_C(0) - t_conv0;
+        cc->stream_conv_us += ggml_time_us() - t_conv0;
     }
     // The audio so far may now be long enough that the final prompt takes the
     // tiled attention path: recompute the cached prefix for it, still while
@@ -2749,7 +2749,7 @@ transcribe_status stream_feed(transcribe_session *       session,
             cc->stream_prefix_tiled = -1;
         }
     }
-    cc->stream_feed_us += INT64_C(0) - t_start;
+    cc->stream_feed_us += ggml_time_us() - t_start;
 
     if (update != nullptr) {
         const int     sr      = std::max(1, cm->hparams.fe_sample_rate);
@@ -2784,17 +2784,17 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
 
         const int n_feed_chunks = cc->stream_n_chunks;
         // The rest of the mel: per_utterance emits n_samples / hop frames.
-        const int64_t t_mel0 = INT64_C(0);
+        const int64_t t_mel0 = ggml_time_us();
         const int     n_out  = cm->mel->n_frames_for(static_cast<size_t>(n_samples)) - 1;
         if (const transcribe_status mst = stream_add_frames(cc, cm, static_cast<size_t>(n_samples), n_out);
             mst != TRANSCRIBE_OK) {
             return mst;
         }
-        cc->t_mel_us = INT64_C(0) - t_mel0;
+        cc->t_mel_us = ggml_time_us() - t_mel0;
 
         // Conv stem for the chunks that were not run yet, and for any early
         // chunk whose normalized mel changed because the max rose after it.
-        const int64_t   t_conv0 = INT64_C(0);
+        const int64_t   t_conv0 = ggml_time_us();
         PrecomputedStem pre{};
         pre.timing        = compute_encoder_timing(n_out, cm->hparams);
         const int n_chunk = pre.timing.n_chunks;
@@ -2804,7 +2804,7 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
         }
         cc->stream_recomputed = n_rerun;
         pre.subsample      = cc->stream_subsample;
-        pre.t_subsample_us = INT64_C(0) - t_conv0;
+        pre.t_subsample_us = ggml_time_us() - t_conv0;
 
         // The assembled mel, for the debug dump only.
         cc->mel_buf.clear();
