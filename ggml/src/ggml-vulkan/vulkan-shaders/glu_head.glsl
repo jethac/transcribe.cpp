@@ -3,7 +3,11 @@
 #include "utils.glsl"
 
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 layout (binding = 1) readonly buffer B {A_TYPE data_b[];};

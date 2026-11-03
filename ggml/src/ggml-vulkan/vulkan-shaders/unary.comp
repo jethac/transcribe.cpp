@@ -1,4 +1,7 @@
 #version 450
+#if defined(GGML_VULKAN_KHR_PROFILE)
+#pragma use_storage_buffer
+#endif
 
 #include "types.glsl"
 #if defined(UNARY_MUL_FUSION)
@@ -12,7 +15,12 @@
 layout(constant_id = 1) const bool op_on_b = false;
 #endif
 
+#if defined(GGML_VULKAN_KHR_PROFILE)
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 #if defined(UNARY_MUL_FUSION)
+const uint num_threads = 128;
+#endif
+#elif defined(UNARY_MUL_FUSION)
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 const uint num_threads = 256;
 #else
@@ -175,7 +183,11 @@ void main() {
 
 #if defined(UNARY_MUL_FUSION)
     // keep total threads at 512
+#if defined(GGML_VULKAN_KHR_PROFILE)
+    [[unroll]] for (uint iter = 0; iter < 4; ++iter) {
+#else
     [[unroll]] for (uint iter = 0; iter < 2; ++iter) {
+#endif
         if (idx >= p.ne) {
             continue;
         }

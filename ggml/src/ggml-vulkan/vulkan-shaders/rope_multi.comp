@@ -1,4 +1,7 @@
 #version 450
+#ifdef GGML_VULKAN_KHR_PROFILE
+#pragma use_storage_buffer
+#endif
 
 #include "rope_head.glsl"
 #include "rope_funcs.glsl"

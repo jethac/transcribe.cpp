@@ -4,7 +4,11 @@
 
 #include "rope_params.glsl"
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+layout(local_size_x = 1, local_size_y = 128, local_size_z = 1) in;
+#else
 layout(local_size_x = 1, local_size_y = 256, local_size_z = 1) in;
+#endif
 
 layout (binding = 0) readonly buffer X {A_TYPE rope_data_a[];};
 layout (binding = 1) readonly buffer Y {int rope_data_pos[];};

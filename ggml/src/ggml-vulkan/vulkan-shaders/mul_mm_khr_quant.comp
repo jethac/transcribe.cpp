@@ -1,0 +1,122 @@
+#version 450
+#pragma use_storage_buffer
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+
+#include "types.glsl"
+
+layout(binding = 0) readonly buffer A { A_TYPE data_a[]; };
+#if defined(A_TYPE_PACKED16)
+layout(binding = 0) readonly buffer A16 { A_TYPE_PACKED16 data_a_packed16[]; };
+#endif
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+#include "dequant_funcs.glsl"
+
+layout(push_constant) uniform parameter {
+    uint M; uint N; uint K;
+    uint stride_a; uint stride_b; uint stride_d;
+    uint batch_stride_a; uint batch_stride_b; uint batch_stride_d;
+    uint base_work_group_z; uint num_batches; uint k_split;
+    uint ne02; uint ne12; uint broadcast2; uint broadcast3;
+    uint padded_n;
+} p;
+
+vec2 weight_pair(uint element) {
+    const uint block = element / QUANT_K;
+    vec2 value = dequantize(block, element % QUANT_K, 0);
+#if defined(DATA_A_Q8_0)
+    value *= float(data_a[block].d);
+#endif
+    return value;
+}
+
+void batch_offsets(out uint a, out uint b, out uint d) {
+    const uint batch = gl_WorkGroupID.z + p.base_work_group_z;
+    const uint a_batch = (batch % p.ne12) / p.broadcast2 +
+                        (batch / p.ne12) / p.broadcast3 * p.ne02;
+    a = a_batch * p.batch_stride_a;
+    b = batch * p.batch_stride_b;
+    d = batch * p.batch_stride_d;
+}
+
+#ifdef KHR_GEMV
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+shared float partial[128];
+
+void main() {
+    uint a, b, d;
+    batch_offsets(a, b, d);
+    const uint col = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x & 31;
+    const uint lane_base = gl_LocalInvocationID.x & ~31u;
+    const uint row_base = gl_WorkGroupID.x * 32;
+    [[dont_unroll]] for (uint block = 0; block < 8 && row_base + block * 4 < p.M; ++block) {
+        const uint row = row_base + block * 4 + (gl_LocalInvocationID.x >> 5);
+        float sum = 0.0;
+        [[dont_unroll]] for (uint k = lane * 2; k < p.K; k += 64) {
+            const vec2 w = row < p.M ? weight_pair(a + row * p.stride_a + k) : vec2(0.0);
+            sum = fma(w.x, data_b[b + col * p.stride_b + k], sum);
+            sum = fma(w.y, data_b[b + col * p.stride_b + k + 1], sum);
+        }
+        partial[lane_base + lane] = sum;
+        barrier();
+        [[dont_unroll]] for (uint width = 16; width != 0; width >>= 1) {
+            if (lane < width) partial[lane_base + lane] += partial[lane_base + lane + width];
+            barrier();
+        }
+        if (lane == 0 && row < p.M) data_d[d + col * p.stride_d + row] = partial[lane_base];
+        barrier();
+    }
+}
+#else
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+shared float tile_a[16][32];
+shared float tile_b[16][32];
+
+void main() {
+    uint a, b, d;
+    batch_offsets(a, b, d);
+    const uint lane = gl_LocalInvocationID.x;
+    const uint row_base = gl_WorkGroupID.x * 128;
+    const uint col0 = gl_WorkGroupID.y * 16;
+    const uint row = (lane & 7) * 2;
+    const uint col = (lane >> 3) * 2;
+    [[dont_unroll]] for (uint tile = 0; tile < 8 && row_base + tile * 16 < p.M; ++tile) {
+        const uint row0 = row_base + tile * 16;
+        vec4 sum = vec4(0.0);
+        [[dont_unroll]] for (uint base = 0; base < p.K; base += 32) {
+            [[dont_unroll]] for (uint i = lane; i < 256; i += 64) {
+                const uint r = i >> 4;
+                const uint k = (i & 15) * 2;
+                vec2 w = vec2(0.0);
+                if (row0 + r < p.M && base + k < p.K)
+                    w = weight_pair(a + (row0 + r) * p.stride_a + base + k);
+                tile_a[r][k] = w.x;
+                tile_a[r][k + 1] = w.y;
+                tile_b[r][k] = col0 + r < p.N && base + k < p.K ?
+                    data_b[b + (col0 + r) * p.stride_b + base + k] : 0.0;
+                tile_b[r][k + 1] = col0 + r < p.N && base + k + 1 < p.K ?
+                    data_b[b + (col0 + r) * p.stride_b + base + k + 1] : 0.0;
+            }
+            barrier();
+            [[dont_unroll]] for (uint k = 0; k < 32; ++k) {
+                const vec2 av = vec2(tile_a[row][k], tile_a[row + 1][k]);
+                const vec2 bv = vec2(tile_b[col][k], tile_b[col + 1][k]);
+                sum = fma(av.xyxy, bv.xxyy, sum);
+            }
+            barrier();
+        }
+        if (col0 + col < p.N) {
+            if (row0 + row < p.M) data_d[d + (col0 + col) * p.stride_d + row0 + row] = sum.x;
+            if (row0 + row + 1 < p.M) data_d[d + (col0 + col) * p.stride_d + row0 + row + 1] = sum.y;
+        }
+        if (col0 + col + 1 < p.N) {
+            if (row0 + row < p.M) data_d[d + (col0 + col + 1) * p.stride_d + row0 + row] = sum.z;
+            if (row0 + row + 1 < p.M) data_d[d + (col0 + col + 1) * p.stride_d + row0 + row + 1] = sum.w;
+        }
+    }
+}
+#endif

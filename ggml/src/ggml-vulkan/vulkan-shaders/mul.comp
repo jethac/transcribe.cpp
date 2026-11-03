@@ -1,9 +1,16 @@
 #version 450
+#if defined(GGML_VULKAN_KHR_PROFILE)
+#pragma use_storage_buffer
+#endif
 
 #include "types.glsl"
 #include "generic_binary_head.glsl"
 
+#if defined(GGML_VULKAN_KHR_PROFILE)
+const uint num_threads = 128;
+#else
 const uint num_threads = 256;
+#endif
 
 layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
 
@@ -11,7 +18,11 @@ void main() {
     uint idx = get_idx();
 
     // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+#if defined(GGML_VULKAN_KHR_PROFILE)
+    const uint num_iter = 4;
+#else
     const uint num_iter = 2;
+#endif
 
     [[unroll]] for (uint i = 0; i < num_iter; ++i) {
         if (idx >= p.ne) {

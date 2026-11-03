@@ -1,4 +1,7 @@
 #version 450
+#ifdef GGML_VULKAN_KHR_PROFILE
+#pragma use_storage_buffer
+#endif
 
 #include "generic_head.glsl"
 #include "types.glsl"

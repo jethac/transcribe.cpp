@@ -1,6 +1,15 @@
 #version 450
+#ifdef GGML_VULKAN_KHR_PROFILE
+#pragma use_storage_buffer
+#endif
 
 #extension GL_EXT_control_flow_attributes : enable
+
+#ifdef GGML_VULKAN_KHR_PROFILE
+#define COLUMN_LOOP [[dont_unroll]]
+#else
+#define COLUMN_LOOP [[unroll]]
+#endif
 
 layout (push_constant) uniform parameter
 {
@@ -75,7 +84,7 @@ void soft_max(uint num_iters) {
     const uint DATA_CACHE_SIZE = 16;
     FLOAT_TYPE data_cache[DATA_CACHE_SIZE];
 
-    [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
+    COLUMN_LOOP for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
         const uint col = col0 + tid;
 
         FLOAT_TYPE a = FLOAT_TYPE(0);
@@ -115,7 +124,7 @@ void soft_max(uint num_iters) {
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
 
     // Compute sum{exp(x - max)}
-    [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
+    COLUMN_LOOP for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
         const uint col = col0 + tid;
 
         if (col >= p.KX) {
@@ -156,7 +165,7 @@ void soft_max(uint num_iters) {
 
     FLOAT_TYPE rcpdivisor = 1.0/sum;
 
-    [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
+    COLUMN_LOOP for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
         const uint col = col0 + tid;
 
         if (col >= p.KX) {
@@ -175,6 +184,11 @@ void main() {
     // instantiate the soft_max function for several different
     // dimensions, to allow loop unrolling
     uint num_blocks = (p.KX + BLOCK_SIZE - 1) / BLOCK_SIZE;
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (num_blocks > 0) {
+        soft_max(num_blocks);
+    }
+#else
     if (num_blocks > 32) {
         soft_max(num_blocks);
     } else if (num_blocks > 16) {
@@ -192,4 +206,5 @@ void main() {
     } else if (num_blocks == 1) {
         soft_max(1);
     }
+#endif
 }

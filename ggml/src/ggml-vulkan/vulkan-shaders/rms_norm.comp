@@ -1,4 +1,7 @@
 #version 450
+#if defined(GGML_VULKAN_KHR_PROFILE)
+#pragma use_storage_buffer
+#endif
 
 #include "generic_binary_head.glsl"
 #include "types.glsl"
@@ -39,7 +42,11 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
+#if defined(GGML_VULKAN_KHR_PROFILE)
+#define BLOCK_SIZE 128
+#else
 #define BLOCK_SIZE 512
+#endif
 
 layout (constant_id = 1) const bool do_multiply = false;
 #if RMS_NORM_ADD_FUSION
@@ -49,6 +56,18 @@ layout (constant_id = 2) const bool do_post_multiply = false;
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+
+// The runtime-length body is only used for the unfused variant; the fused
+// variants keep the unrolled loops.
+#if defined(GGML_VULKAN_KHR_PROFILE) && !RMS_NORM_ADD_FUSION && !RMS_NORM_SET_ROWS_FUSION && !RMS_NORM_ROPE_FUSION
+#define RMS_NORM_RUNTIME_BODY 1
+#endif
+
+#if RMS_NORM_RUNTIME_BODY
+#define RMS_NORM_COLUMN_LOOP [[dont_unroll]]
+#else
+#define RMS_NORM_COLUMN_LOOP [[unroll]]
+#endif
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -76,7 +95,7 @@ void rms_norm(uint num_iters) {
 #endif
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
 
-    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+    RMS_NORM_COLUMN_LOOP for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
         FLOAT_TYPE xi = FLOAT_TYPE(0);
         if (col < ncols) {
             xi = FLOAT_TYPE(data_a[a_offset + col]);
@@ -101,7 +120,7 @@ void rms_norm(uint num_iters) {
 
     if (do_multiply) {
         if (ncols > p.ne10) {
-            [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+            RMS_NORM_COLUMN_LOOP for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 if (col >= ncols) {
                     continue;
                 }
@@ -115,7 +134,7 @@ void rms_norm(uint num_iters) {
                 data_d[d_offset + col] = D_TYPE(value);
             }
         } else {
-            [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+            RMS_NORM_COLUMN_LOOP for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 if (col >= ncols) {
                     continue;
                 }
@@ -130,7 +149,7 @@ void rms_norm(uint num_iters) {
             }
         }
     } else {
-        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+        RMS_NORM_COLUMN_LOOP for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
             if (col >= ncols) {
                 continue;
             }
@@ -154,6 +173,17 @@ void main() {
     // instantiate the rms_norm function for several different
     // dimensions, to allow loop unrolling
     uint num_blocks = (p.ne00 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+#if RMS_NORM_RUNTIME_BODY
+    const uint num_iters = num_blocks > 32 ? num_blocks :
+                           num_blocks > 16 ? 32 :
+                           num_blocks > 12 ? 16 :
+                           num_blocks > 10 ? 12 :
+                           num_blocks > 8 ? 10 :
+                           num_blocks > 4 ? 8 : num_blocks;
+    if (num_blocks != 0) {
+        rms_norm(num_iters);
+    }
+#else
     if (num_blocks > 32) {
         rms_norm(num_blocks);
     } else if (num_blocks > 16) {
@@ -175,4 +205,5 @@ void main() {
     } else if (num_blocks == 1) {
         rms_norm(1);
     }
+#endif
 }

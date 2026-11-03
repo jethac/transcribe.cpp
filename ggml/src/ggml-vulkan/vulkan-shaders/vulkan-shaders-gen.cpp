@@ -42,6 +42,8 @@ std::locale c_locale("C");
 
 std::string GLSLC = "glslc";
 std::string input_filepath = "";
+std::string selected_shader_name;
+bool selected_shader_seen = false;
 std::string output_dir = "/tmp";
 std::string target_hpp = "";
 std::string target_cpp = "";
@@ -349,12 +351,78 @@ compile_count_guard acquire_compile_slot() {
 
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
     std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
+#ifdef GGML_VULKAN_KHR_PROFILE
+    const std::vector<std::string> profile_variants = {
+        "khr_quant_q4_k_mm", "khr_quant_q4_k_mv",
+        "khr_quant_q6_k_mm", "khr_quant_q6_k_mv",
+        "khr_quant_q8_0_mm", "khr_quant_q8_0_mv",
+        "repeat_i16",
+        "set_rows_f32_f16_i64",
+        "add_f32_f32_f32",
+        "argmax_f32",
+        "concat_i32",
+        "contig_cpy_f16_f16",
+        "contig_cpy_f16_f32",
+        "contig_cpy_f32_f16",
+        "contig_cpy_f32_f32",
+        "cpy_f16_f16",
+        "cpy_f16_f32",
+        "cpy_f32_f16",
+        "cpy_f32_f32",
+        "cpy_transpose_02_16",
+        "cpy_transpose_02_32",
+        "cpy_transpose_16",
+        "cpy_transpose_32",
+        "dequant_f32",
+        "dequant_q4_k",
+        "dequant_q6_k",
+        "dequant_q8_0",
+        "gelu_erf_f32",
+        "get_rows_f16_f32",
+        "get_rows_f32_f32",
+        "get_rows_q4_k_f32",
+        "get_rows_q6_k_f32",
+        "get_rows_q8_0_f32",
+        "im2col_f32",
+        "im2col_f32_f16",
+        "matmul_f16_f32_fp32",
+        "matmul_f16_fp32",
+        "matmul_f32_f16_fp32",
+        "matmul_f32_f32_fp32",
+        "mul_f32_f32_f32",
+        "mul_mat_vec_f16_f32_f32",
+        "mul_mat_vec_f32_f32_f32",
+        "mul_mat_vec_nc_f16_f32",
+        "mul_mat_vec_p021_f16_f32",
+        "mul_mat_vec_q4_k_f32_f32",
+        "mul_mat_vec_q6_k_f32_f32",
+        "mul_mat_vec_q8_0_f32_f32",
+        "norm_f32",
+        "rms_norm_f32",
+        "rope_multi_f32",
+        "rope_neox_f32",
+        "rope_norm_f32",
+        "scale_f32",
+        "silu_f32",
+        "soft_max_f32",
+        "soft_max_f32_f16",
+        "split_k_reduce",
+        "swiglu_f32"
+    };
+    if (std::find(profile_variants.begin(), profile_variants.end(), name) != profile_variants.end()) {
+        target_env = "--target-env=vulkan1.0";
+    }
+#endif
 
     #ifdef _WIN32
         std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};
     #else
         std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, in_path, "-o", out_path};
     #endif
+
+#ifdef GGML_VULKAN_KHR_PROFILE
+    cmd.push_back("-DGGML_VULKAN_KHR_PROFILE=1");
+#endif
 
     // disable spirv-opt for coopmat shaders for https://github.com/ggml-org/llama.cpp/issues/10734
     // disable spirv-opt for bf16 shaders for https://github.com/ggml-org/llama.cpp/issues/15344
@@ -435,6 +503,7 @@ std::map<std::string, std::string> merge_maps(const std::map<std::string, std::s
 static std::deque<std::future<void>> compiles;
 void string_to_spv(std::string name, const std::string& source, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, const std::string& suffix = "") {
     name = name + (f16acc ? "_f16acc" : "") + (coopmat ? "_cm1" : "") + (coopmat2 ? "_cm2" : (fp16 ? "" : "_fp32")) + suffix;
+    if (!selected_shader_name.empty() && name != selected_shader_name) return;
     std::string out_path = join_paths(output_dir, name + ".spv");
 
     if (input_filepath == "") {
@@ -446,6 +515,7 @@ void string_to_spv(std::string name, const std::string& source, const std::map<s
         return;
     }
 
+    selected_shader_seen = true;
     compile_count_guard slot = acquire_compile_slot();
     compiles.push_back(std::async(
         string_to_spv_func, name, input_filepath, out_path, defines, coopmat, generate_dep_file, std::move(slot)));
@@ -679,6 +749,20 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 }
 
 void process_shaders() {
+#ifdef GGML_VULKAN_KHR_PROFILE
+    for (const std::string & type : {"q4_k", "q6_k", "q8_0"}) {
+        for (bool gemv : {false, true}) {
+            std::map<std::string, std::string> defs = {
+                {"DATA_A_" + to_uppercase(type), "1"},
+                {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"},
+                {"FLOAT_TYPEV4", "vec4"}, {"LOAD_VEC_A", "1"}
+            };
+            if (gemv) defs["KHR_GEMV"] = "1";
+            string_to_spv("khr_quant_" + type + (gemv ? "_mv" : "_mm"),
+                          "mul_mm_khr_quant.comp", defs);
+        }
+    }
+#endif
     // matmul
     for (const MatMulIdType& matmul_id_type : {MatMulIdType::NONE, MatMulIdType::DEFAULT, MatMulIdType::SUBGROUP}) {
         // No coopmats
@@ -1405,6 +1489,9 @@ int main(int argc, char** argv) {
     if (args.find("--glslc") != args.end()) {
         GLSLC = args["--glslc"]; // Path to glslc
     }
+    if (args.find("--shader-name") != args.end()) {
+        selected_shader_name = args["--shader-name"];
+    }
     if (args.find("--source") != args.end()) {
         input_filepath = args["--source"]; // The shader source file to compile
     }
@@ -1427,6 +1514,10 @@ int main(int argc, char** argv) {
 
     process_shaders();
 
+    if (!selected_shader_name.empty() && !selected_shader_seen) {
+        std::cerr << "vulkan-shaders-gen: requested shader name/source has no matching variant: " << selected_shader_name << std::endl;
+        return EXIT_FAILURE;
+    }
     if (compile_failed) {
         std::cerr << "vulkan-shaders-gen: one or more shaders failed to compile" << std::endl;
         return EXIT_FAILURE;

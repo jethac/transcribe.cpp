@@ -3,6 +3,10 @@ project("vulkan-shaders-gen" C CXX)
 
 find_package (Threads REQUIRED)
 
+if (GGML_VULKAN_KHR_PROFILE)
+    add_compile_definitions(GGML_VULKAN_KHR_PROFILE)
+endif()
+
 if (GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     add_compile_definitions(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     message(STATUS "Enabling coopmat glslc support")

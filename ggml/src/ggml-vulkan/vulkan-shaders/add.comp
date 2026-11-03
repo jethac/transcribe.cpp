@@ -1,4 +1,7 @@
 #version 450
+#if defined(GGML_VULKAN_KHR_PROFILE)
+#pragma use_storage_buffer
+#endif
 
 #extension GL_EXT_shader_16bit_storage : require
 #if ADD_RMS
@@ -9,7 +12,11 @@
 #include "types.glsl"
 #include "generic_binary_head.glsl"
 
+#if defined(GGML_VULKAN_KHR_PROFILE)
+const uint num_threads = 128;
+#else
 const uint num_threads = 256;
+#endif
 
 layout (binding = 3, std430) buffer PartialBuf {float partial_sums[];};
 
@@ -25,7 +32,11 @@ void main() {
     uint orig_idx = idx;
 
     // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+#if defined(GGML_VULKAN_KHR_PROFILE)
+    const uint num_iter = 4;
+#else
     const uint num_iter = 2;
+#endif
 
     FLOAT_TYPE sum_sq = 0;
 

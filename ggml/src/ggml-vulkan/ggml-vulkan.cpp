@@ -1,4 +1,213 @@
+#include "asr_resource_snapshot.h"
 #include "ggml-vulkan-common.h"
+
+#include <cerrno>
+#include <atomic>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+static constexpr size_t ggml_vk_pipeline_cache_limit = 16 * 1024 * 1024;
+
+static bool ggml_vk_pipeline_cache_header(const vk_device_struct & device, const std::vector<uint8_t> & data) {
+    if (data.size() < sizeof(VkPipelineCacheHeaderVersionOne)) return false;
+    VkPipelineCacheHeaderVersionOne header;
+    memcpy(&header, data.data(), sizeof(header));
+    return header.headerSize == sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+        header.vendorID == device.properties.vendorID && header.deviceID == device.properties.deviceID &&
+        memcmp(header.pipelineCacheUUID, device.properties.pipelineCacheUUID.data(), VK_UUID_SIZE) == 0;
+}
+
+#ifndef _WIN32
+struct ggml_vk_cache_fd {
+    int fd;
+    explicit ggml_vk_cache_fd(int value) : fd(value) {}
+    ~ggml_vk_cache_fd() { if (fd >= 0) close(fd); }
+    ggml_vk_cache_fd(const ggml_vk_cache_fd &) = delete;
+    ggml_vk_cache_fd & operator=(const ggml_vk_cache_fd &) = delete;
+};
+
+static std::vector<uint8_t> ggml_vk_pipeline_cache_read(vk_device_struct & device) {
+    const char * path = getenv("GGML_VK_PIPELINE_CACHE");
+    if (!path || !*path) return {};
+    std::string full(path);
+    const auto slash = full.find_last_of('/');
+    if (full.front() != '/' || slash == std::string::npos || slash + 1 == full.size()) {
+        std::cerr << "ggml_vulkan: pipeline cache requires an absolute file path\n";
+        return {};
+    }
+    const std::string base = full.substr(slash + 1);
+    if (base == "." || base == ".." || base.size() > 180) return {};
+    const std::string parent = slash ? full.substr(0, slash) : "/";
+    ggml_vk_cache_fd dir(open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    struct stat st;
+    if (dir.fd < 0 || fstat(dir.fd, &st) || st.st_uid != geteuid() || (st.st_mode & 0022)) {
+        std::cerr << "ggml_vulkan: pipeline cache directory must be owned and privately writable\n";
+        return {};
+    }
+    device.pipeline_cache_name = base;
+    device.pipeline_cache_dir = dir.fd;
+    dir.fd = -1;
+    ggml_vk_cache_fd file(openat(device.pipeline_cache_dir, base.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    if (file.fd < 0) return {};
+    if (fstat(file.fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1 || (st.st_mode & 0022) ||
+        st.st_size < (off_t) sizeof(VkPipelineCacheHeaderVersionOne) || (uint64_t) st.st_size > ggml_vk_pipeline_cache_limit) {
+        std::cerr << "ggml_vulkan: rejected pipeline cache file metadata\n";
+        return {};
+    }
+    std::vector<uint8_t> data((size_t) st.st_size);
+    size_t done = 0;
+    while (done < data.size()) {
+        const ssize_t count = read(file.fd, data.data() + done, data.size() - done);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return {};
+        done += (size_t) count;
+    }
+    uint8_t extra;
+    if (read(file.fd, &extra, 1) != 0 || !ggml_vk_pipeline_cache_header(device, data)) {
+        std::cerr << "ggml_vulkan: rejected stale or corrupt pipeline cache header\n";
+        return {};
+    }
+    return data;
+}
+
+static bool ggml_vk_pipeline_cache_write(vk_device_struct & device, const std::vector<uint8_t> & data) {
+    struct stat st;
+    if (fstatat(device.pipeline_cache_dir, device.pipeline_cache_name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1) return false;
+    } else if (errno != ENOENT) {
+        return false;
+    }
+    static std::atomic<uint64_t> serial{0};
+    const std::string temporary = "." + device.pipeline_cache_name + ".tmp." + std::to_string(getpid()) +
+        "." + std::to_string(serial.fetch_add(1, std::memory_order_relaxed));
+    ggml_vk_cache_fd file(openat(device.pipeline_cache_dir, temporary.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+    if (file.fd < 0) return false;
+    size_t done = 0;
+    bool ok = true;
+    while (done < data.size()) {
+        const ssize_t count = write(file.fd, data.data() + done, data.size() - done);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { ok = false; break; }
+        done += (size_t) count;
+    }
+    if (ok && fsync(file.fd)) ok = false;
+    if (close(file.fd)) ok = false;
+    file.fd = -1;
+    if (ok && renameat(device.pipeline_cache_dir, temporary.c_str(),
+                       device.pipeline_cache_dir, device.pipeline_cache_name.c_str())) ok = false;
+    if (!ok) unlinkat(device.pipeline_cache_dir, temporary.c_str(), 0);
+    if (ok && fsync(device.pipeline_cache_dir)) ok = false;
+    return ok;
+}
+#endif
+
+static void ggml_vk_pipeline_cache_init(vk_device_struct & device) {
+    std::vector<uint8_t> data;
+    try {
+#ifndef _WIN32
+        data = ggml_vk_pipeline_cache_read(device);
+#endif
+    } catch (const std::exception & e) {
+        std::cerr << "ggml_vulkan: pipeline cache import skipped: " << e.what() << '\n';
+    }
+    VkPipelineCacheCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    VkResult result = vkCreatePipelineCache(device.device, &info, nullptr, &device.pipeline_cache);
+    if (result != VK_SUCCESS && !data.empty()) {
+        data.clear();
+        info.initialDataSize = 0;
+        info.pInitialData = nullptr;
+        result = vkCreatePipelineCache(device.device, &info, nullptr, &device.pipeline_cache);
+    }
+    if (result != VK_SUCCESS) {
+        device.pipeline_cache = VK_NULL_HANDLE;
+        std::cerr << "ggml_vulkan: optional pipeline cache unavailable result=" << result << '\n';
+    } else {
+        std::cerr << "ggml_vulkan: pipeline cache initialized import_bytes=" << data.size() << '\n';
+    }
+}
+
+static void ggml_vk_pipeline_cache_save(vk_device_struct & device) {
+    std::lock_guard<std::mutex> lock(device.pipeline_cache_mutex);
+    if (device.pipeline_cache != VK_NULL_HANDLE) {
+        try {
+#ifndef _WIN32
+            if (device.pipeline_cache_dir >= 0) {
+                size_t size = 0;
+                if (vkGetPipelineCacheData(device.device, device.pipeline_cache, &size, nullptr) == VK_SUCCESS &&
+                    size >= sizeof(VkPipelineCacheHeaderVersionOne) && size <= ggml_vk_pipeline_cache_limit) {
+                    std::vector<uint8_t> data(size);
+                    if (vkGetPipelineCacheData(device.device, device.pipeline_cache, &size, data.data()) == VK_SUCCESS &&
+                        size <= data.size()) {
+                        data.resize(size);
+                        if (ggml_vk_pipeline_cache_header(device, data) && ggml_vk_pipeline_cache_write(device, data)) {
+                            std::cerr << "ggml_vulkan: pipeline cache saved bytes=" << data.size() << '\n';
+                        } else {
+                            std::cerr << "ggml_vulkan: optional pipeline cache save skipped\n";
+                        }
+                    }
+                }
+            }
+#endif
+        } catch (const std::exception & e) {
+            std::cerr << "ggml_vulkan: pipeline cache export skipped: " << e.what() << '\n';
+        }
+    }
+}
+
+static void ggml_vk_pipeline_cache_finish(vk_device_struct & device) {
+    ggml_vk_pipeline_cache_save(device);
+    std::lock_guard<std::mutex> lock(device.pipeline_cache_mutex);
+    if (device.pipeline_cache != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(device.device, device.pipeline_cache, nullptr);
+        device.pipeline_cache = VK_NULL_HANDLE;
+    }
+#ifndef _WIN32
+    if (device.pipeline_cache_dir >= 0) {
+        close(device.pipeline_cache_dir);
+        device.pipeline_cache_dir = -1;
+    }
+#endif
+}
+
+#ifdef GGML_VULKAN_KHR_PROFILE
+#include "ggml-vulkan-khr-profile.hpp"
+#define getProperties2 getProperties2KHR
+
+static void ggml_vk_profile_get_features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 * features) {
+    const auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2KHR>(
+        vkGetInstanceProcAddr(static_cast<VkInstance>(vk_instance.instance), "vkGetPhysicalDeviceFeatures2KHR"));
+    if (!query) throw std::runtime_error("KHR profile missing enabled instance entrypoint vkGetPhysicalDeviceFeatures2KHR");
+    query(physical, features);
+}
+
+static bool ggml_vk_profile_matmul_type(ggml_type type) {
+    switch (type) {
+    case GGML_TYPE_F32:
+    case GGML_TYPE_F16:
+    case GGML_TYPE_Q4_K:
+    case GGML_TYPE_Q6_K:
+    case GGML_TYPE_Q8_0:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static vk::Result ggml_vk_profile_wait_semaphores(vk::Device device, const vk::SemaphoreWaitInfo & info, uint64_t timeout) {
+    const auto wait = reinterpret_cast<PFN_vkWaitSemaphoresKHR>(
+        vkGetDeviceProcAddr(static_cast<VkDevice>(device), "vkWaitSemaphoresKHR"));
+    if (!wait) throw std::runtime_error("KHR profile missing enabled device entrypoint vkWaitSemaphoresKHR");
+    return static_cast<vk::Result>(wait(static_cast<VkDevice>(device),
+                                      reinterpret_cast<const VkSemaphoreWaitInfo *>(&info), timeout));
+}
+#endif
 
 namespace {
 inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
@@ -584,6 +793,19 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
 
+
+
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (spv_size < 20 || spv_size % 4 ||
+        reinterpret_cast<const uint32_t *>(spv_data)[1] > 0x00010000u) {
+        throw std::runtime_error("KHR profile requires a validated Vulkan1.0 shader variant: " + pipeline->name);
+    }
+#endif
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (parameter_count > ggml_vk_khr_profile_descriptor_capacity(device->properties)) {
+        throw std::runtime_error("KHR profile pipeline exceeds actual storage-buffer descriptor capacity: " + pipeline->name);
+    }
+#endif
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
 
     // Patch SPIR-V to enable supported FP16 float controls, avoiding the need
@@ -774,7 +996,8 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 #endif
 
     try {
-        pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
+        std::lock_guard<std::mutex> cache_lock(device->pipeline_cache_mutex);
+        pipeline->pipeline = device->device.createComputePipeline(vk::PipelineCache(device->pipeline_cache), compute_pipeline_create_info).value;
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: compute pipeline creation failed for " << pipeline->name << ": " << e.what() << std::endl;
         throw;
@@ -1047,7 +1270,12 @@ std::unique_ptr<vk_queue> ggml_vk_create_queue(vk_device& device, uint32_t queue
         h = std::make_shared<vk_queue_handle_synchronized>();
     }
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+    GGML_ASSERT(!device->has_internally_synchronized_queues);
+    h->queue = device->device.getQueue(queue_family_index, queue_index);
+#else
     h->queue = device->device.getQueue2(queue_info2);
+#endif
     h->device = device;
     // Avoid concurrent submissions on NVIDIA due to driver bug.
     if (device->vendor_id == VK_VENDOR_ID_NVIDIA) {
@@ -1887,8 +2115,25 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool use_cm1_int = device->coopmat_int_support &&
                                  (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+        const auto & profile_limits = device->properties.limits;
+        if (profile_limits.maxComputeSharedMemorySize < 4096 ||
+            profile_limits.maxComputeWorkGroupInvocations < 128 ||
+            profile_limits.maxComputeWorkGroupSize[0] < 128) {
+            throw std::runtime_error("KHR quantized matrix kernels exceed device workgroup/shared-memory limits");
+        }
+#endif
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
+#ifdef GGML_VULKAN_KHR_PROFILE
+            if (!ggml_vk_profile_matmul_type(t)) {
+                device->mul_mat_s[i] = device->mul_mat_m[i] = device->mul_mat_l[i] = false;
+                device->mul_mat_s_int[i] = device->mul_mat_m_int[i] = device->mul_mat_l_int[i] = false;
+                device->mul_mat_id_s[i] = device->mul_mat_id_m[i] = device->mul_mat_id_l[i] = false;
+                device->mul_mat_id_s_int[i] = device->mul_mat_id_m_int[i] = device->mul_mat_id_l_int[i] = false;
+                continue;
+            }
+#endif
             // Disable medium and large matrix multiplication if not enough shared memory is available
             // Check mmq warptiles as the largest configuration
             // Throw an error if not enough for any matrix multiplication is available
@@ -1966,8 +2211,31 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     auto const &ggml_vk_create_pipeline = [&](vk_device& device, vk_pipeline& base_pipeline, const char *name, size_t spv_size, const void* spv_data, const char *entrypoint,
-                                              uint32_t parameter_count, uint32_t push_constant_size, std::array<uint32_t, 3> wg_denoms, const std::vector<uint32_t>& specialization_constants,
+                                              uint32_t parameter_count, uint32_t push_constant_size, std::array<uint32_t, 3> wg_denoms, const std::vector<uint32_t>& input_specialization_constants,
                                               uint32_t align, bool disable_robustness = false, bool require_full_subgroups = false, uint32_t required_subgroup_size = 0) {
+
+        std::vector<uint32_t> specialization_constants = input_specialization_constants;
+#ifdef GGML_VULKAN_KHR_PROFILE
+    const std::string profile_name(name);
+    const std::vector<std::string> unary_ops = {"elu", "gelu", "gelu_erf", "gelu_quick", "silu", "relu", "sqr", "sqrt", "sin", "cos", "clamp", "leaky_relu", "xielu", "neg", "tanh", "sigmoid", "hardsigmoid", "hardswish", "abs", "softplus", "step", "round", "ceil", "floor", "trunc", "sgn", "exp", "expm1"};
+    const bool direct_unary = std::any_of(unary_ops.begin(), unary_ops.end(), [&](const std::string & op) { return profile_name == op + "_f32" || profile_name == op + "_f16"; });
+    const bool direct_copy = profile_name.rfind("cpy_", 0) == 0 && profile_name.find("transpose") == std::string::npos;
+    if (profile_name == "repeat_i16" && wg_denoms[0] == 512) wg_denoms[0] = 128;
+    const bool direct_glu = profile_name.rfind("swiglu", 0) == 0 || profile_name.rfind("reglu", 0) == 0 || profile_name.rfind("geglu", 0) == 0;
+    if ((direct_unary || direct_copy || direct_glu || profile_name.rfind("concat_", 0) == 0) && wg_denoms[0] == 512) {
+        wg_denoms[0] = 128;
+    }
+    if (profile_name == "get_rows_i32") {
+        wg_denoms[0] = 128;
+    } else if (profile_name.rfind("get_rows_", 0) == 0) {
+        if (wg_denoms[0] == 512) wg_denoms[0] = 128;
+        else if (wg_denoms[0] == 1024) wg_denoms[0] = 256;
+    }
+    if (profile_name.rfind("rope_", 0) == 0 && wg_denoms[1] == 512) wg_denoms[1] = 256;
+    if ((profile_name == "f32_to_f16" || (profile_name == "dequant_q8_0" || profile_name == "dequant_q8_0_transpose")) && wg_denoms[0] == 4096) wg_denoms[0] = 2048;
+    if (profile_name == "split_k_reduce" && wg_denoms[0] == 1024) wg_denoms[0] = 512;
+    if (profile_name.rfind("soft_max_", 0) == 0 && !specialization_constants.empty() && specialization_constants[0] == 512) specialization_constants[0] = 128;
+#endif
 
         if (!require_full_subgroups && required_subgroup_size == 0) {
             required_subgroup_size = get_subgroup_size(name, device->architecture);
@@ -2822,6 +3090,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             create_mm_pipelines({GGML_TYPE_BF16, GGML_TYPE_BF16, true, false}, tc_bf16_id_filtered, "matmul_id_bf16", matmul_id_bf16_fp32_len, matmul_id_bf16_fp32_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count, bf16_spec);
         }
     }
+
+#ifdef GGML_VULKAN_KHR_PROFILE
+#define KHR_QUANT_PIPELINE(I, TYPE, PHASE, MODE, X, Y) \
+    ggml_vk_create_pipeline(device, device->pipeline_khr_quant[I][MODE], \
+        "khr_quant_" #TYPE "_" #PHASE, khr_quant_##TYPE##_##PHASE##_len, \
+        khr_quant_##TYPE##_##PHASE##_data, "main", 3, sizeof(vk_mat_mat_push_constants), \
+        {X, Y, 1}, {}, 1);
+    KHR_QUANT_PIPELINE(0, q4_k, mm, 0, 128, 16)
+    KHR_QUANT_PIPELINE(0, q4_k, mv, 1, 32, 1)
+    KHR_QUANT_PIPELINE(1, q6_k, mm, 0, 128, 16)
+    KHR_QUANT_PIPELINE(1, q6_k, mv, 1, 32, 1)
+    KHR_QUANT_PIPELINE(2, q8_0, mm, 0, 128, 16)
+    KHR_QUANT_PIPELINE(2, q8_0, mv, 1, 32, 1)
+#undef KHR_QUANT_PIPELINE
+#endif
 
     // Set up tile selector functions
     if (device->coopmat2) {
@@ -3974,10 +4257,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // at the end to flip compile_pending/compiled and notify waiters.
     if (has_claimed_task) {
         auto & task = claimed_task;
+        static std::atomic<unsigned> diagnostic_compiles {0};
+        const char * diagnostic_env = getenv("TRANSCRIBE_RESOURCE_DIAGNOSTICS");
+        const bool diagnostics = diagnostic_env && strcmp(diagnostic_env, "1") == 0 &&
+            diagnostic_compiles.fetch_add(1, std::memory_order_relaxed) < 64;
+        if (diagnostics) {
+            std::cerr << "ASR_PIPELINE_BEGIN name=" << task.pipeline->name << "\n" << std::flush;
+            asr_resource_snapshot("compile_begin", task.pipeline->name.c_str());
+        }
         ggml_vk_create_pipeline_func(device, task.pipeline, task.spv_size, task.spv_data,
                                      task.entrypoint, task.parameter_count, task.wg_denoms,
                                      task.specialization_constants, task.disable_robustness,
                                      task.require_full_subgroups, task.required_subgroup_size);
+        if (diagnostics) {
+            std::cerr << "ASR_PIPELINE_END name=" << task.pipeline->name << "\n" << std::flush;
+            asr_resource_snapshot("compile_end", task.pipeline->name.c_str());
+        }
+        asr_release_unused_heap("compile_return", task.pipeline->name.c_str(), diagnostics);
     }
 
     // Another thread may be compiling the pipeline we need; block on it here.
@@ -4113,6 +4409,9 @@ vk_device ggml_vk_get_device(size_t idx) {
             }
         }
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+        internally_sync_support = false;
+#endif
         vk::PhysicalDeviceProperties2 props2;
         vk::PhysicalDeviceMaintenance3Properties props3;
         vk::PhysicalDeviceMaintenance4Properties props4;
@@ -4126,6 +4425,10 @@ vk_device ggml_vk_get_device(size_t idx) {
         vk::PhysicalDeviceShaderIntegerDotProductPropertiesKHR shader_integer_dot_product_props;
         vk::PhysicalDeviceExternalMemoryHostPropertiesEXT external_memory_host_props;
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+        props2.pNext = &props3;
+        VkBaseOutStructure * last_struct = (VkBaseOutStructure *)&props3;
+#else
         props2.pNext = &props3;
         props3.pNext = &subgroup_props;
         subgroup_props.pNext = &driver_props;
@@ -4133,6 +4436,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         vk11_props.pNext = &vk12_props;
 
         VkBaseOutStructure * last_struct = (VkBaseOutStructure *)&vk12_props;
+#endif
 
         if (maintenance4_support) {
             last_struct->pNext = (VkBaseOutStructure *)&props4;
@@ -4171,6 +4475,9 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->physical_device.getProperties2(&props2);
         device->properties = props2.properties;
+#ifdef GGML_VULKAN_KHR_PROFILE
+        ggml_vk_khr_profile_descriptor_capacity(device->properties);
+#endif
         device->vendor_id = device->properties.vendorID;
         device->driver_id = driver_props.driverID;
 
@@ -4220,7 +4527,12 @@ vk_device ggml_vk_get_device(size_t idx) {
         }
         device->suballocation_block_size = std::min(device->suballocation_block_size, device->max_memory_allocation_size);
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+        // Internal workgroup tiling quantum; no subgroup operations are enabled.
+        device->subgroup_size = 32;
+#else
         device->subgroup_size = subgroup_props.subgroupSize;
+#endif
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
         if (sm_builtins) {
@@ -4316,6 +4628,17 @@ vk_device ggml_vk_get_device(size_t idx) {
         vk11_features.pNext = &vk12_features;
 
         last_struct = (VkBaseOutStructure *)&vk12_features;
+#ifdef GGML_VULKAN_KHR_PROFILE
+        ggml_vk_khr_profile_features khr_features;
+        if (!ggml_vk_khr_profile_extensions(device->physical_device)) {
+            throw std::runtime_error("KHR profile missing required storage/arithmetic/timeline/maintenance extensions");
+        }
+        vk11_features = {};
+        vk12_features = {};
+        device_features2.pNext = &khr_features.storage16;
+        last_struct = (VkBaseOutStructure *)&khr_features.timeline;
+        ggml_vk_khr_profile_features::append_extensions(device_extensions);
+#endif
 
         VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR internally_synchronized_queues_features{};
         internally_synchronized_queues_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR;
@@ -4472,7 +4795,17 @@ vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_EXT_device_fault");
         }
 
+        #ifdef GGML_VULKAN_KHR_PROFILE
+        ggml_vk_profile_get_features2(device->physical_device, &device_features2);
+#else
         vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
+#endif
+#ifdef GGML_VULKAN_KHR_PROFILE
+        khr_features.mirror(vk11_features, vk12_features);
+        if (!khr_features.required_supported()) {
+            throw std::runtime_error("KHR profile requires storage16, storage8, shaderInt8 and timelineSemaphore");
+        }
+#endif
 
         device->device_fault = device->device_fault && fault_features.deviceFault;
 
@@ -4761,12 +5094,17 @@ vk_device ggml_vk_get_device(size_t idx) {
 #endif
         device->name = GGML_VK_NAME + std::to_string(idx);
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+        std::sort(device_extensions.begin(), device_extensions.end(), [](const char * a, const char * b) { return std::strcmp(a, b) < 0; });
+        device_extensions.erase(std::unique(device_extensions.begin(), device_extensions.end(), [](const char * a, const char * b) { return std::strcmp(a, b) == 0; }), device_extensions.end());
+#endif
         device_create_info
             .setFlags(vk::DeviceCreateFlags())
             .setQueueCreateInfos(device_queue_create_infos)
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+        ggml_vk_pipeline_cache_init(*device);
 
         if (device->device_fault) {
             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
@@ -4860,7 +5198,13 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         std::vector<vk::DescriptorSetLayoutBinding> dsl_binding;
         std::vector<vk::DescriptorBindingFlags> dsl_binding_flags;
-        for (uint32_t i = 0; i < MAX_PARAMETER_COUNT; i++) {
+        for (uint32_t i = 0; i <
+#ifdef GGML_VULKAN_KHR_PROFILE
+             ggml_vk_khr_profile_descriptor_capacity(device->properties)
+#else
+             MAX_PARAMETER_COUNT
+#endif
+             ; i++) {
             dsl_binding.push_back({i, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute});
             dsl_binding_flags.push_back({});
         }
@@ -4870,7 +5214,9 @@ vk_device ggml_vk_get_device(size_t idx) {
         vk::DescriptorSetLayoutCreateInfo descriptor_set_layout_create_info(
             {},
             dsl_binding);
+#ifndef GGML_VULKAN_KHR_PROFILE
         descriptor_set_layout_create_info.setPNext(&dslbfci);
+#endif
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
         ggml_vk_load_shaders(device);
@@ -4906,6 +5252,9 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->serialize_submissions = getenv("GGML_VK_SERIALIZE_SUBMISSIONS") != nullptr;
 
         device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+#ifdef GGML_VULKAN_KHR_PROFILE
+        device->disable_fusion = true;
+#endif
 
         device->disable_descriptor_reuse = getenv("GGML_VK_DISABLE_DESCRIPTOR_REUSE") != nullptr;
 
@@ -5009,12 +5358,17 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     vk::PhysicalDeviceSubgroupProperties subgroup_props;
     vk::PhysicalDeviceDriverProperties driver_props;
     vk::PhysicalDeviceShaderIntegerDotProductPropertiesKHR shader_integer_dot_product_props;
+#ifdef GGML_VULKAN_KHR_PROFILE
+    props2.pNext = &props3;
+    VkBaseOutStructure * last_struct = (VkBaseOutStructure *)&props3;
+#else
     props2.pNext = &props3;
     props3.pNext = &subgroup_props;
     subgroup_props.pNext = &driver_props;
 
     // Pointer to the last chain element
     VkBaseOutStructure * last_struct = (VkBaseOutStructure *)&driver_props;
+#endif
 
     if (integer_dot_product) {
         last_struct->pNext = (VkBaseOutStructure *)&shader_integer_dot_product_props;
@@ -5039,6 +5393,16 @@ static void ggml_vk_print_gpu_info(size_t idx) {
 
     // Pointer to the last chain element
     last_struct = (VkBaseOutStructure *)&vk12_features;
+#ifdef GGML_VULKAN_KHR_PROFILE
+    ggml_vk_khr_profile_features khr_features;
+    if (!ggml_vk_khr_profile_extensions(physical_device)) {
+        throw std::runtime_error("KHR profile missing required storage/arithmetic/timeline/maintenance extensions");
+    }
+    vk11_features = {};
+    vk12_features = {};
+    device_features2.pNext = &khr_features.storage16;
+    last_struct = (VkBaseOutStructure *)&khr_features.timeline;
+#endif
 
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopmat_features;
@@ -5106,7 +5470,17 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     }
 #endif
 
-    vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
+    #ifdef GGML_VULKAN_KHR_PROFILE
+        ggml_vk_profile_get_features2(physical_device, &device_features2);
+#else
+        vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
+#endif
+#ifdef GGML_VULKAN_KHR_PROFILE
+    khr_features.mirror(vk11_features, vk12_features);
+    if (!khr_features.required_supported()) {
+        throw std::runtime_error("KHR profile requires storage16, storage8, shaderInt8 and timelineSemaphore");
+    }
+#endif
 
     fp16 = fp16 && vk12_features.shaderFloat16;
 
@@ -5189,12 +5563,27 @@ void ggml_vk_instance_init() {
     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
     ggml_vk_default_dispatcher_instance.init(vkGetInstanceProcAddr);
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+    const char * profile_policy = getenv("TRANSCRIBE_VULKAN_KHR_PROFILE");
+    if (!profile_policy || strcmp(profile_policy, "1")) {
+        throw std::runtime_error("KHR backend requires explicit TRANSCRIBE_VULKAN_KHR_PROFILE=1 ASR graph-placement policy");
+    }
+    const char * no_flash = getenv("TRANSCRIBE_NO_FLASH");
+    const char * force_flash = getenv("TRANSCRIBE_FORCE_FLASH");
+    if (!no_flash || !no_flash[0] || no_flash[0] == '0' ||
+        (force_flash && force_flash[0] && force_flash[0] != '0')) {
+        throw std::runtime_error("KHR compute profile requires TRANSCRIBE_NO_FLASH=1 and no TRANSCRIBE_FORCE_FLASH; non-flash attention stays on GPU");
+    }
+    std::cerr << "ggml_vulkan: KHR compute profile: non-flash GPU graph, unfused GPU operations, FP32 arithmetic, physical workgroup limit unchanged" << std::endl;
+    uint32_t api_version = VK_API_VERSION_1_0;
+#else
     uint32_t api_version = vk::enumerateInstanceVersion();
-
     if (api_version < VK_API_VERSION_1_2) {
         std::cerr << "ggml_vulkan: Error: Vulkan 1.2 required." << std::endl;
         throw vk::SystemError(vk::Result::eErrorFeatureNotPresent, "Vulkan 1.2 required");
     }
+
+#endif
 
     vk::ApplicationInfo app_info{ "ggml-vulkan", 1, nullptr, 0, api_version };
 
@@ -5210,6 +5599,16 @@ void ggml_vk_instance_init() {
         layers.push_back("VK_LAYER_KHRONOS_validation");
     }
     std::vector<const char*> extensions;
+#ifdef GGML_VULKAN_KHR_PROFILE
+    const char * required_instance[] = {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+                                        VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME};
+    for (const char * name : required_instance) {
+        bool found = false;
+        for (const auto & extension : instance_extensions) found |= std::strcmp(extension.extensionName, name) == 0;
+        if (!found) throw std::runtime_error("KHR profile missing required instance extension");
+        extensions.push_back(name);
+    }
+#endif
     if (layer_settings) {
         extensions.push_back("VK_EXT_layer_settings");
     }
@@ -5268,11 +5667,19 @@ void ggml_vk_instance_init() {
 
     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
     VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance);
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2KHR) {
+        throw std::runtime_error("KHR profile missing enabled instance entrypoint vkGetPhysicalDeviceProperties2KHR");
+    }
+#endif
 
     std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
 
     // Emulate behavior of CUDA_VISIBLE_DEVICES for Vulkan
     char * devices_env = getenv("GGML_VK_VISIBLE_DEVICES");
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (devices_env == nullptr) throw std::runtime_error("KHR profile requires explicit GGML_VK_VISIBLE_DEVICES");
+#endif
     if (devices_env != nullptr) {
         size_t num_available_devices = devices.size();
 
@@ -5969,6 +6376,9 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
         ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false) {
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (ggml_is_quantized(src0_type)) return nullptr;
+#endif
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
     vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc};
     auto it = ctx->device->pipeline_matmul.find(key);
@@ -6021,7 +6431,7 @@ static void ggml_vk_matmul_id(
 bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
     return
         tensor->nb[0] == ggml_type_size(tensor->type) &&
-        tensor->nb[1] == (tensor->nb[0]*tensor->ne[0])/ggml_blck_size(tensor->type) &&
+        (tensor->ne[1] == 1 || tensor->nb[1] == (tensor->nb[0]*tensor->ne[0])/ggml_blck_size(tensor->type)) &&
         (tensor->ne[3] == 1 || tensor->nb[3] == tensor->nb[2]*tensor->ne[2]);
 }
 
@@ -6381,6 +6791,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (qx_needs_dequant && x_sz > ctx->device->properties.limits.maxStorageBufferRange) {
+        throw std::runtime_error("KHR compute profile requires direct quantized matmul or bounded GPU tiling for this weight; full FP16 temporary exceeds actual descriptor range");
+    }
+#endif
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -6533,11 +6948,21 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
+    vk_subbuffer output_span = ggml_vk_subbuffer(ctx, d_D, d_buf_offset);
+#ifdef GGML_VULKAN_KHR_PROFILE
+    output_span.size = ggml_nbytes(dst);
+    if (!output_span.size || d_buf_offset > d_D->size ||
+        output_span.size > d_D->size - d_buf_offset ||
+        output_span.size > ctx->device->properties.limits.maxStorageBufferRange) {
+        throw std::runtime_error("KHR matrix output strided tensor span exceeds actual buffer/range");
+    }
+#endif
+
     // compute
     ggml_vk_matmul(
         ctx, subctx, pipeline,
         { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
-        ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
+        std::move(output_span), { ctx->prealloc_split_k, 0, d_sz * split_k },
         ne01, ne11, ne10,
         ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
@@ -7227,21 +7652,86 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+static bool ggml_vk_mul_mat_khr_quant(ggml_backend_vk_context * ctx, vk_context & subctx,
+                                      const ggml_tensor * src0, const ggml_tensor * src1,
+                                      const ggml_tensor * dst) {
+    int type;
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K: type = 0; break;
+        case GGML_TYPE_Q6_K: type = 1; break;
+        case GGML_TYPE_Q8_0: type = 2; break;
+        default: return false;
+    }
+    if (ctx->num_additional_fused_ops || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_vk_dim01_contiguous(src0) || !ggml_vk_dim01_contiguous(src1) ||
+        dst->nb[0] != sizeof(float) || src0->ne[0] % ggml_blck_size(src0->type) != 0)
+        return false;
+    const auto & limits = ctx->device->properties.limits;
+    if (ggml_nbytes(src0) > limits.maxStorageBufferRange ||
+        ggml_nbytes(src1) > limits.maxStorageBufferRange ||
+        ggml_nbytes(dst) > limits.maxStorageBufferRange)
+        return false;
+    const bool gemv = dst->ne[1] <= mul_mat_vec_max_cols;
+    const uint64_t rows_per_group = gemv ? 32 : 128;
+    const uint64_t cols_per_group = gemv ? 1 : 16;
+    if (uint64_t(dst->ne[0]) > rows_per_group * limits.maxComputeWorkGroupCount[0] ||
+        uint64_t(dst->ne[1]) > cols_per_group * limits.maxComputeWorkGroupCount[1] ||
+        uint64_t(dst->ne[2]) * dst->ne[3] > UINT32_MAX)
+        return false;
+    vk_pipeline pipeline = ctx->device->pipeline_khr_quant[type][gemv ? 1 : 0];
+    vk_subbuffer a = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer b = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer d = ggml_vk_tensor_subbuffer(ctx, dst);
+    ggml_vk_matmul(ctx, subctx, pipeline, std::move(a), std::move(b), std::move(d),
+        {nullptr, 0, 0}, dst->ne[0], dst->ne[1], src0->ne[0],
+        src0->nb[1] / ggml_type_size(src0->type) * ggml_blck_size(src0->type),
+        src1->nb[1] / sizeof(float), dst->nb[1] / sizeof(float),
+        ggml_vk_batch_stride(src0), ggml_vk_batch_stride(src1), ggml_vk_batch_stride(dst),
+        1, dst->ne[2] * dst->ne[3], src0->ne[2], src1->ne[2],
+        src1->ne[2] / src0->ne[2], src1->ne[3] / src0->ne[3], dst->ne[1]);
+    return true;
+}
+#endif
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
 
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (ggml_vk_mul_mat_khr_quant(ctx, subctx, src0, src1, dst)) return;
+#endif
+
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
     // Split_k doesn't work with M splitting.
     // This only supports batchsize == 1.
     const size_t nbytes = ggml_nbytes(src0);
-    const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
+    bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
+    size_t split_row_bytes = src0->nb[1];
+#ifdef GGML_VULKAN_KHR_PROFILE
+    const bool direct_matvec = dst->ne[1] == 1 ||
+        (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1);
+    if (!direct_matvec && ggml_is_quantized(src0->type) && dst->ne[2] == 1 && dst->ne[3] == 1) {
+        if (!ggml_vk_dim01_contiguous(src0) || src0->ne[2] != 1 || src0->ne[3] != 1) {
+            throw std::runtime_error("KHR quantized matrix chunks require contiguous unbatched weights");
+        }
+        const uint64_t elements = uint64_t(ggml_nelements(src0));
+        if (elements > SIZE_MAX / sizeof(ggml_fp16_t)) throw std::runtime_error("KHR FP16 storage size overflow");
+        split_row_bytes = sizeof(ggml_fp16_t) * src0->ne[0];
+        needs_split = needs_split || elements * sizeof(ggml_fp16_t) > ctx->device->properties.limits.maxStorageBufferRange;
+    }
+#endif
     if (needs_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
-        const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
+        uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * split_row_bytes);
+#ifdef GGML_VULKAN_KHR_PROFILE
+        const uint32_t row_alignment = std::max(1u, uint32_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment));
+        M_split -= M_split % row_alignment;
+        if (!M_split) throw std::runtime_error("KHR matrix row cannot fit the bounded aligned GPU temporary");
+#endif
         uint32_t m_offset = 0;
         while (m_offset < dst->ne[0]) {
             const uint32_t cur_M_size = std::min(M_split, (uint32_t)(dst->ne[0] - m_offset));
@@ -7253,6 +7743,10 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
 
             dst2.view_offs += m_offset * dst->nb[0];
             src02.view_offs += m_offset * src0->nb[1];
+#ifdef GGML_VULKAN_KHR_PROFILE
+            src02.data = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(src0->data) + m_offset * src0->nb[1]);
+            dst2.data = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dst->data) + m_offset * dst->nb[0]);
+#endif
             dst2.ne[0] = cur_M_size;
             src02.ne[1] = cur_M_size;
 
@@ -9677,7 +10171,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
             } else {
                 // scalar types do one element per thread, running 512 threads
+#ifdef GGML_VULKAN_KHR_PROFILE
+                ne = CEIL_DIV(ne, 128);
+#else
                 ne = CEIL_DIV(ne, 512);
+#endif
             }
             if (ne > 262144) {
                 elements = { 512, 512, CEIL_DIV(ne, 262144) };
@@ -13158,6 +13656,7 @@ void ggml_backend_vk_free(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
     ggml_vk_cleanup(ctx);
+    ggml_vk_pipeline_cache_save(*ctx->device);
 
     delete ctx;
     delete backend;
@@ -15402,6 +15901,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_type src0_type = op->src[0]->type;
+#ifdef GGML_VULKAN_KHR_PROFILE
+                if (op->op == GGML_OP_MUL_MAT_ID || !ggml_vk_profile_matmul_type(src0_type) ||
+                    (op->src[1]->type != GGML_TYPE_F32 && op->src[1]->type != GGML_TYPE_F16) ||
+                    op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+#endif
                 if (op->op == GGML_OP_MUL_MAT_ID) {
                     if (!device->mul_mat_id_s[src0_type] && !device->mul_mat_id_m[src0_type] && !device->mul_mat_id_l[src0_type]) {
                         // If there's not enough shared memory for row_ids and the result tile, fallback to CPU
@@ -16054,7 +16560,11 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
         vk::Semaphore sem = vkev->tl_semaphore.s;
         uint64_t val = vkev->tl_semaphore.value;
         vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
+#ifdef GGML_VULKAN_KHR_PROFILE
+        VK_CHECK(ggml_vk_profile_wait_semaphores(device->device, swi, UINT64_MAX), "event_synchronize", device);
+#else
         VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize", device);
+#endif
 
         // Reset and move submitted events
         for (auto& event : vkev->events_submitted) {
@@ -16235,6 +16745,13 @@ bool ggml_vk_instance_debug_utils_ext_available(
 }
 
 bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
+#ifdef GGML_VULKAN_KHR_PROFILE
+    if (!ggml_vk_khr_profile_extensions(vkdev)) return false;
+    ggml_vk_khr_profile_features khr;
+    VkPhysicalDeviceFeatures2KHR core{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR, &khr.storage16, {}};
+    ggml_vk_profile_get_features2(vkdev, &core);
+    return khr.required_supported();
+#else
     VkPhysicalDeviceFeatures2 device_features2;
     device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 
@@ -16246,6 +16763,7 @@ bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
     vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
 
     return vk11_features.storageBuffer16BitAccess;
+#endif
 }
 
 bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch) {
@@ -16396,6 +16914,7 @@ vk_device_struct::~vk_device_struct() {
 
     device.destroyDescriptorSetLayout(dsl);
 
+    ggml_vk_pipeline_cache_finish(*this);
     device.destroy();
 }
 

@@ -687,6 +687,10 @@ struct vk_device_struct {
     // runs with no lock held, so different pipelines can compile in parallel.
     // Lock order is device->mutex -> compile_mutex, never the reverse.
     std::mutex compile_mutex;
+    std::mutex pipeline_cache_mutex;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    int pipeline_cache_dir = -1;
+    std::string pipeline_cache_name;
     std::condition_variable compile_cv;
 
     uint32_t debug_cmdbuf_idx {};
@@ -813,6 +817,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+#ifdef GGML_VULKAN_KHR_PROFILE
+    vk_pipeline pipeline_khr_quant[3][2];
+#endif
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 

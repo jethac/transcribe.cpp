@@ -8,6 +8,8 @@ endif()
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
 
+option(GGML_VULKAN_KHR_PROFILE "Build the explicit Vulkan1.0 KHR compatibility profile" OFF)
+
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
@@ -75,6 +77,10 @@ if (Vulkan_FOUND)
                           VISIBILITY_INLINES_HIDDEN ON)
 
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
+    if (GGML_VULKAN_KHR_PROFILE)
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_VULKAN_KHR_PROFILE)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_KHR_PROFILE=ON)
+    endif()
 
     # Test all shader extensions
     test_shader_extension_support(

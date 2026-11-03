@@ -1,4 +1,7 @@
 #version 450
+#ifdef GGML_VULKAN_KHR_PROFILE
+#pragma use_storage_buffer
+#endif
 
 #include "dequant_head.glsl"
 
@@ -8,7 +11,12 @@ layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
 void main() {
-    [[unroll]] for (uint wgy = 0; wgy < 256; wgy++) {
+#if defined(GGML_VULKAN_KHR_PROFILE)
+    [[dont_unroll]]
+#else
+    [[unroll]]
+#endif
+    for (uint wgy = 0; wgy < 256; wgy++) {
         const uint ib = gl_WorkGroupID.x * 256 + wgy;
         if (ib >= p.nel / QUANT_K) {
             return;

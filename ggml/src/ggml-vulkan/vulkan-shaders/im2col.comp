@@ -1,4 +1,7 @@
 #version 450
+#ifdef GGML_VULKAN_KHR_PROFILE
+#pragma use_storage_buffer
+#endif
 
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require
