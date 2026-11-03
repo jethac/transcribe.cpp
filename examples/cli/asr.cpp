@@ -10,6 +10,7 @@
 #include "wav.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -17,11 +18,28 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#    include <sys/resource.h>
+#endif
 
 using transcribe_cli::cli_args;
 
 namespace {
+
+// User + system CPU time of the whole process so far, in ms (0 where
+// getrusage is unavailable).
+double process_cpu_ms() {
+#ifndef _WIN32
+    struct rusage ru {};
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        return (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000.0 + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000.0;
+    }
+#endif
+    return 0.0;
+}
 
 // Minimal JSON string escape: covers the characters MUST be escaped by
 // the JSON spec (quote, backslash, control chars). Transcribed text is
@@ -528,6 +546,19 @@ int run_asr_batch(const cli_args & args, std::ofstream * output) {
             // Run. When --stream-chunk-ms > 0, drive the streaming API
             // for this utterance (begin/feed/finalize) so the WER
             // harness can measure cache-aware streaming output.
+            //
+            // --stream-realtime: the audio is taken to start arriving at
+            // t_start; slice k is fed once its last sample would have
+            // arrived. End of audio is t_start + its duration; latency is
+            // from then to the final text. Offline, the run starts at the
+            // end of the audio. t_start_ms is on the monotonic clock, to line
+            // up with other measurements taken during the run.
+            using clock               = std::chrono::steady_clock;
+            const clock::time_point t_start = clock::now();
+            clock::time_point       t_audio_end = t_start;
+            double                  cpu_at_end  = 0.0;
+            double                  feed_max_ms = 0.0;
+            const double            cpu_start   = process_cpu_ms();
             transcribe_status run_st = TRANSCRIBE_OK;
             if (args.stream_chunk_ms > 0) {
                 struct transcribe_stream_params sp;
@@ -564,9 +595,25 @@ int run_asr_batch(const cli_args & args, std::ofstream * output) {
                     size_t    pos           = 0;
                     while (pos < pcm.size()) {
                         const size_t take = std::min<size_t>(static_cast<size_t>(chunk_samples), pcm.size() - pos);
+                        const bool   last = pos + take == pcm.size();
+                        if (args.stream_realtime) {
+                            const clock::time_point due =
+                                t_start + std::chrono::microseconds(static_cast<int64_t>(pos + take) * 1000000 / 16000);
+                            std::this_thread::sleep_until(due);
+                            if (last) {
+                                t_audio_end = due;
+                                cpu_at_end  = process_cpu_ms();
+                            }
+                        } else if (last) {
+                            t_audio_end = clock::now();
+                            cpu_at_end  = process_cpu_ms();
+                        }
                         struct transcribe_stream_update upd;
                         transcribe_stream_update_init(&upd);
+                        const clock::time_point t_feed = clock::now();
                         run_st = transcribe_stream_feed(ctx, pcm.data() + pos, static_cast<int>(take), &upd);
+                        feed_max_ms = std::max(
+                            feed_max_ms, std::chrono::duration<double, std::milli>(clock::now() - t_feed).count());
                         if (run_st != TRANSCRIBE_OK) {
                             break;
                         }
@@ -579,7 +626,28 @@ int run_asr_batch(const cli_args & args, std::ofstream * output) {
                     }
                 }
             } else {
-                run_st = transcribe_run(ctx, pcm.data(), static_cast<int>(pcm.size()), &rp);
+                if (args.stream_realtime) {
+                    t_audio_end = t_start + std::chrono::microseconds(static_cast<int64_t>(pcm.size()) * 1000000 / 16000);
+                    std::this_thread::sleep_until(t_audio_end);
+                } else {
+                    t_audio_end = clock::now();
+                }
+                cpu_at_end = process_cpu_ms();
+                run_st     = transcribe_run(ctx, pcm.data(), static_cast<int>(pcm.size()), &rp);
+            }
+            std::string latency_field;
+            if (args.stream_realtime) {
+                const double cpu_done   = process_cpu_ms();
+                const double latency_ms = std::chrono::duration<double, std::milli>(clock::now() - t_audio_end).count();
+                const double t_start_ms =
+                    std::chrono::duration<double, std::milli>(t_start.time_since_epoch()).count();
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                              ",\"t_start_ms\":%.1f,\"audio_ms\":%.1f,\"latency_ms\":%.1f,\"cpu_during_ms\":%.1f,"
+                              "\"cpu_after_ms\":%.1f,\"feed_max_ms\":%.1f",
+                              t_start_ms, pcm.size() / 16.0, latency_ms, cpu_at_end - cpu_start, cpu_done - cpu_at_end,
+                              feed_max_ms);
+                latency_field = buf;
             }
 
             // OUTPUT_TRUNCATED / OUTPUT_REPETITION are result-bearing: the partial
@@ -630,9 +698,9 @@ int run_asr_batch(const cli_args & args, std::ofstream * output) {
                 std::printf(
                     "{\"file\":\"%s\",\"text\":\"%s\"%s,"
                     "\"mel_ms\":%.1f,\"encode_ms\":%.1f,"
-                    "\"decode_ms\":%.1f%s}\n",
+                    "\"decode_ms\":%.1f%s%s}\n",
                     file_esc.c_str(), escaped.c_str(), segments.c_str(), (double) tm.mel_ms, (double) tm.encode_ms,
-                    (double) tm.decode_ms, err_field.c_str());
+                    (double) tm.decode_ms, latency_field.c_str(), err_field.c_str());
             } else {
                 std::printf("[%zu/%zu] %s", i + 1, wav_paths.size(), wav.c_str());
                 if (run_st == TRANSCRIBE_OK) {

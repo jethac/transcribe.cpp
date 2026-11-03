@@ -95,6 +95,10 @@ void print_usage(const char * argv0) {
                  "  --stream-chunk-ms N   (ASR) single-file: drive the streaming API by\n"
                  "                        feeding N-ms PCM slices; requires model to\n"
                  "                        advertise supports_streaming\n"
+                 "  --stream-realtime     (ASR, --batch-jsonl) feed the --stream-chunk-ms\n"
+                 "                        slices at real-time pace and report latency_ms\n"
+                 "                        (end of audio to final text) and CPU time; without\n"
+                 "                        --stream-chunk-ms, time the offline run the same way\n"
                  "  --stream-att-right R  (parakeet streaming) pick the right-context\n"
                  "                        setting from the model's training menu;\n"
                  "                        nemotron-speech-streaming-en-0.6b accepts\n"
@@ -485,6 +489,8 @@ bool parse_args(int argc, char ** argv, cli_args & out) {
                 std::fprintf(stderr, "error: --stream-chunk-ms must be > 0\n");
                 return false;
             }
+        } else if (a == "--stream-realtime") {
+            out.stream_realtime = true;
         } else if (a == "--stream-att-right") {
             const char * v = take_value(a.c_str());
             if (!v) {

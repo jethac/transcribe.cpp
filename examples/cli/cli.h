@@ -78,6 +78,12 @@ struct cli_args {
     // the loaded model to advertise supports_streaming; the DIARIZE,
     // LANGID and VAD drivers refuse it. Set by --stream-chunk-ms N.
     int stream_chunk_ms      = 0;
+    // Latency measurement (--stream-realtime): with --stream-chunk-ms, each
+    // slice is fed when it would have finished arriving from a live source
+    // (sleeping in between); without it, the offline call is timed the same
+    // way. Batch JSONL then carries latency_ms (end of audio to final text)
+    // and the process CPU time during and after the audio.
+    bool stream_realtime     = false;
     // Parakeet streaming: pick a right-context (lookahead) setting
     // from the model's training menu. -1 = model default (max
     // accuracy / max latency); 0/1/6/13 select the published
